@@ -6,38 +6,37 @@ require("dotenv").config({ path: path.join(__dirname, "../.env") });
 
 const { fetchReportCsv, fetchCampaignTypeMap } = require("./five9Client");
 const {
-  calls:       MOCK_CALLS,
-  agents:      MOCK_AGENTS,
-  campaigns:   MOCK_CAMPAIGNS,
+  calls:        MOCK_CALLS,
+  agents:       MOCK_AGENTS,
+  campaigns:    MOCK_CAMPAIGNS,
   outboundANIs: MOCK_ANIS,
+  agentSessions: MOCK_AGENT_SESSIONS,
 } = require("./data/mockData");
 
-const app         = express();
-const PORT        = process.env.PORT || 4000;
-const REFRESH_MS  = (parseInt(process.env.REFRESH_INTERVAL) || 300) * 1000;
-const CACHE_DAYS  = parseInt(process.env.CACHE_DAYS) || 30;
+const { applyGlobalFilters } = require("./utils/filters");
+
+const app        = express();
+const PORT       = process.env.PORT || 4000;
+const REFRESH_MS = (parseInt(process.env.REFRESH_INTERVAL) || 300) * 1000;
+const CACHE_DAYS = parseInt(process.env.CACHE_DAYS) || 30;
 
 app.use(cors());
 app.use(express.json());
 
 // ── Outbound classification config ─────────────────────────────────────────
-// These sets act as overrides / supplements to the Five9 Type field.
+// RULE 1: ANI in outboundANIs  →  outbound
+// RULE 2: campaignName in outbound campaigns  →  outbound
+// Both rules are applied in classifyCall() — used by enrichCall() on every record.
 const OUTBOUND_ANI_SET      = new Set(MOCK_ANIS.map((a) => a.number));
 const OUTBOUND_CAMPAIGN_SET = new Set(
   MOCK_CAMPAIGNS.filter((c) => c.type === "outbound").map((c) => c.name)
 );
 
 // ── Campaign type map (fetched from Five9 config API) ──────────────────────
-// campaignName → "inbound" | "outbound"
-// Populated at startup alongside the call cache; empty map = fall back to heuristics.
 let _campaignTypeMap = new Map();
 
 // ── Cache ──────────────────────────────────────────────────────────────────
-// Stores the last CACHE_DAYS of call data in memory.
-// Refreshes automatically every REFRESH_MS milliseconds.
-let _cache = null;
-// { calls, fetchedAt, rangeStart, rangeEnd, usingMock }
-
+let _cache     = null;
 let _refreshing = false;
 
 async function doRefresh() {
@@ -49,8 +48,6 @@ async function doRefresh() {
     start.setDate(start.getDate() - CACHE_DAYS);
     start.setHours(0, 0, 0, 0);
 
-    // Fetch campaign types first (fast, lightweight call) so the classifier
-    // is populated before we parse the call log.
     try {
       _campaignTypeMap = await fetchCampaignTypeMap();
     } catch (e) {
@@ -85,20 +82,25 @@ function isCacheStale() {
   return Date.now() - _cache.fetchedAt.getTime() > REFRESH_MS;
 }
 
-// Returns calls for a date range from cache (refreshes if stale).
-async function getCalls(start, end) {
+// Primary data accessor — stale-while-revalidate.
+// Pass this function to route factories so they never touch _cache directly.
+async function getCalls() {
   if (!_cache) {
     await doRefresh();
   } else if (isCacheStale()) {
-    doRefresh(); // stale-while-revalidate: return existing data, refresh in background
+    doRefresh(); // return existing data immediately; refresh in background
   }
   return _cache.calls;
 }
 
+// Session data accessor — currently always returns mock data.
+// Replace with a DB query when moving to PostgreSQL.
+function getAgentSessions() {
+  return MOCK_AGENT_SESSIONS;
+}
+
 // ── CSV parser ─────────────────────────────────────────────────────────────
 
-// Flexible column aliases — Five9 has varied column names across report versions.
-// "timestamp" covers a combined date+time column (Five9's default layout).
 const COL_ALIASES = {
   timestamp:   ["timestamp", "call timestamp", "date time", "datetime"],
   date:        ["date", "call date"],
@@ -108,7 +110,7 @@ const COL_ALIASES = {
   dnis:        ["dnis", "dialed number", "to", "called number"],
   campaign:    ["campaign", "campaign name"],
   agent:       ["agent name", "agent full name"],
-  agentkey:    ["agent"],    // Five9 "AGENT" col is an internal key, not the display name
+  agentkey:    ["agent"],
   duration:    ["talk time", "duration", "call duration", "handle time"],
   disposition: ["disposition", "call disposition", "final disposition"],
 };
@@ -132,7 +134,7 @@ function mapHeaders(rawHeaders) {
 function parseDuration(val) {
   if (!val || !val.trim()) return 0;
   const s = val.trim();
-  if (/^\d+$/.test(s)) return parseInt(s, 10);       // raw seconds
+  if (/^\d+$/.test(s)) return parseInt(s, 10);
   const parts = s.split(":").map(Number);
   if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
   if (parts.length === 2) return parts[0] * 60 + parts[1];
@@ -141,17 +143,14 @@ function parseDuration(val) {
 
 function parseFive9Date(dateStr, timeStr) {
   if (!dateStr) return null;
-  // Five9 uses MM/DD/YYYY
   const mdy = dateStr.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
   if (mdy) {
     const iso = `${mdy[3]}-${mdy[1].padStart(2, "0")}-${mdy[2].padStart(2, "0")}`;
     return new Date(`${iso}T${timeStr || "00:00:00"}`);
   }
-  // Already ISO-ish
   return new Date(`${dateStr}T${timeStr || "00:00:00"}`);
 }
 
-// Auto-detect whether CSV uses commas or pipes as delimiter
 function detectDelimiter(firstLine) {
   const pipes  = (firstLine.match(/\|/g) || []).length;
   const commas = (firstLine.match(/,/g)  || []).length;
@@ -160,10 +159,8 @@ function detectDelimiter(firstLine) {
 
 function splitLine(line, delim) {
   if (delim === "|") return line.split("|").map((s) => s.trim());
-  // Comma-delimited: respect quoted fields
   const result = [];
-  let cur = "";
-  let inQ = false;
+  let cur = ""; let inQ = false;
   for (let i = 0; i < line.length; i++) {
     const ch = line[i];
     if (ch === '"') {
@@ -179,7 +176,6 @@ function splitLine(line, delim) {
   return result;
 }
 
-// Derive a stable, slug-style agent ID from the agent's display name.
 const _agentIds = new Map();
 function agentIdFromName(name) {
   if (!name) return "unknown";
@@ -193,8 +189,6 @@ function parseCallLog(csv) {
   if (!csv || !csv.trim()) return [];
 
   const lines = csv.split("\n").map((l) => l.replace(/\r$/, ""));
-
-  // Skip preamble until we hit the header row
   let hi = 0;
   while (hi < lines.length) {
     const lower = lines[hi].toLowerCase();
@@ -206,14 +200,12 @@ function parseCallLog(csv) {
     return [];
   }
 
-  // Auto-detect delimiter from the header line
   const delim   = detectDelimiter(lines[hi]);
   const headers = splitLine(lines[hi], delim);
   const idx     = mapHeaders(headers);
 
   console.log(`[CSV] Delimiter: '${delim}' | Mapped columns:`, idx);
 
-  // Must have at least a timestamp or date column
   if (idx.timestamp === undefined && idx.date === undefined) {
     console.warn("[CSV] No date/timestamp column found. Raw headers:", headers.join(" | "));
     return [];
@@ -225,11 +217,9 @@ function parseCallLog(csv) {
   for (let i = hi + 1; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) continue;
-
     const cols = splitLine(line, delim);
     if (cols.length < 2) continue;
 
-    // Timestamp: prefer single TIMESTAMP column; fall back to DATE + TIME
     let timestamp;
     if (idx.timestamp != null) {
       const raw = cols[idx.timestamp] || "";
@@ -242,14 +232,13 @@ function parseCallLog(csv) {
       timestamp = ts && !isNaN(ts) ? ts.toISOString() : new Date().toISOString();
     }
 
-    const rawType    = idx.type        != null ? cols[idx.type]        : "";
-    const ani        = idx.ani         != null ? cols[idx.ani]         : "";
-    const dnis       = idx.dnis        != null ? cols[idx.dnis]        : "";
-    const campaign   = idx.campaign    != null ? cols[idx.campaign]    : "";
-    // Prefer AGENT NAME for display; fall back to AGENT key
-    const agentName  = idx.agent       != null ? cols[idx.agent]       :
-                       idx.agentkey    != null ? cols[idx.agentkey]    : "";
-    const durRaw     = idx.duration    != null ? cols[idx.duration]    : "0";
+    const rawType     = idx.type        != null ? cols[idx.type]        : "";
+    const ani         = idx.ani         != null ? cols[idx.ani]         : "";
+    const dnis        = idx.dnis        != null ? cols[idx.dnis]        : "";
+    const campaign    = idx.campaign    != null ? cols[idx.campaign]    : "";
+    const agentName   = idx.agent       != null ? cols[idx.agent]       :
+                        idx.agentkey    != null ? cols[idx.agentkey]    : "";
+    const durRaw      = idx.duration    != null ? cols[idx.duration]    : "0";
     const disposition = idx.disposition != null ? cols[idx.disposition] : "Unknown";
 
     const typeUC = rawType.toUpperCase().trim();
@@ -262,6 +251,8 @@ function parseCallLog(csv) {
       five9Type = "inbound";
     }
 
+    const duration = parseDuration(durRaw);
+
     counter++;
     result.push(enrichCall({
       id:           `f9_${counter}`,
@@ -271,9 +262,25 @@ function parseCallLog(csv) {
       campaignName: campaign    || "Unknown",
       agentId:      agentIdFromName(agentName),
       agentName:    agentName   || "Unknown",
-      duration:     parseDuration(durRaw),
+      duration,
       disposition:  disposition || "Unknown",
       five9Type,
+      // New fields — derived where possible from Five9 CSV; placeholders otherwise.
+      // Full values come from mock data or a Five9 detail report.
+      talkTimeSeconds:      duration,  // Five9 "talk time" col maps directly if present
+      holdTimeSeconds:      0,
+      wrapUpTimeSeconds:    0,
+      queueWaitSeconds:     0,
+      answeredWithinThreshold: null,
+      pickupFlag:           null,
+      conversionFlag:       false,
+      saveFlag:             false,
+      transferred:          false,
+      escalatedToClinical:  false,
+      campaignType:         null,
+      dialedMarketingNumber: dnis || null,
+      contactAttemptNumber: 1,
+      abandoned:            five9Type === "abandoned",
     }));
   }
 
@@ -281,11 +288,12 @@ function parseCallLog(csv) {
 }
 
 // ── Call classification ────────────────────────────────────────────────────
-// Priority order:
-//  1. Five9 CALL TYPE field (authoritative when it says OUTBOUND)
-//  2. Campaign type from Five9 config API (_campaignTypeMap)
-//  3. Explicit ANI list
-//  4. Campaign name heuristic (contains "outbound")
+// IMPORTANT: This is the single implementation of the dual-rule outbound logic.
+// All routes use calls already enriched by this function (via getCalls()).
+//   Rule 1: ANI in OUTBOUND_ANI_SET          → outbound
+//   Rule 2: campaignName in Five9 config map → outbound
+//   Rule 3: campaignName in OUTBOUND_CAMPAIGN_SET (from mock config)
+//   Rule 4: campaignName contains "outbound" (heuristic fallback)
 function classifyCall(call) {
   if (call.five9Type === "outbound") return "outbound";
 
@@ -293,39 +301,39 @@ function classifyCall(call) {
   if (mappedType === "outbound") return "outbound";
   if (mappedType === "inbound")  return "inbound";
 
-  if (call.ani && OUTBOUND_ANI_SET.has(call.ani)) return "outbound";
+  if (call.ani && OUTBOUND_ANI_SET.has(call.ani))               return "outbound";
+  if (OUTBOUND_CAMPAIGN_SET.has(call.campaignName))             return "outbound";
   if (call.campaignName && /outbound/i.test(call.campaignName)) return "outbound";
 
   return call.five9Type || "inbound";
 }
 
 function enrichCall(call) {
-  return { ...call, callType: classifyCall(call) };
+  const callType = call.five9Type === "abandoned"
+    ? "inbound"   // abandoned callers were trying to reach inbound
+    : classifyCall(call);
+
+  const campaignMeta = MOCK_CAMPAIGNS.find(c => c.name === call.campaignName);
+  return {
+    ...call,
+    callType,
+    campaignType: call.campaignType || (campaignMeta ? campaignMeta.type : callType),
+  };
 }
 
-// ── Date-range filter ──────────────────────────────────────────────────────
-function filterByRange(list, start, end) {
-  const s = start ? new Date(start).getTime() : -Infinity;
-  const e = end   ? new Date(end).getTime()   :  Infinity;
-  return list.filter((c) => {
-    const t = new Date(c.timestamp).getTime();
-    return t >= s && t <= e;
-  });
-}
-
-async function getFiltered(req) {
-  const { start, end } = req.query;
-  const all = await getCalls(start, end);
-  return filterByRange(all, start, end);
-}
-
-// ── Boot: warm the cache ───────────────────────────────────────────────────
+// ── Boot ───────────────────────────────────────────────────────────────────
 doRefresh().catch(() => {});
 setInterval(() => doRefresh().catch(() => {}), REFRESH_MS);
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  REST ENDPOINTS  (same shape as original — frontend unchanged)
+//  EXISTING ENDPOINTS (preserved — no breaking changes)
 // ══════════════════════════════════════════════════════════════════════════════
+
+// Legacy helper — supports both old (start/end) and new global filter params.
+async function getFiltered(req) {
+  const all = await getCalls();
+  return applyGlobalFilters(all, req.query);
+}
 
 app.get("/api/calls", async (req, res) => {
   try { res.json(await getFiltered(req)); }
@@ -335,10 +343,11 @@ app.get("/api/calls", async (req, res) => {
 app.get("/api/calls/summary", async (req, res) => {
   try {
     const filtered      = await getFiltered(req);
-    const totalCalls    = filtered.length;
-    const totalInbound  = filtered.filter((c) => c.callType === "inbound").length;
-    const totalOutbound = filtered.filter((c) => c.callType === "outbound").length;
-    const totalDuration = filtered.reduce((s, c) => s + c.duration, 0);
+    const nonAbandoned  = filtered.filter(c => !c.abandoned);
+    const totalCalls    = nonAbandoned.length;
+    const totalInbound  = nonAbandoned.filter((c) => c.callType === "inbound").length;
+    const totalOutbound = nonAbandoned.filter((c) => c.callType === "outbound").length;
+    const totalDuration = nonAbandoned.reduce((s, c) => s + (c.duration || 0), 0);
     const avgDuration   = totalCalls > 0 ? Math.round(totalDuration / totalCalls) : 0;
     res.json({ totalCalls, totalInbound, totalOutbound, avgDuration });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -353,7 +362,7 @@ app.get("/api/calls/by-campaign", async (req, res) => {
         map[call.campaignName] = { campaignName: call.campaignName, count: 0, totalDuration: 0 };
       }
       map[call.campaignName].count++;
-      map[call.campaignName].totalDuration += call.duration;
+      map[call.campaignName].totalDuration += call.duration || 0;
     }
     const result = Object.values(map)
       .map((g) => ({ ...g, avgDuration: Math.round(g.totalDuration / g.count) }))
@@ -393,6 +402,7 @@ app.get("/api/calls/by-agent", async (req, res) => {
   try {
     const map = {};
     for (const call of await getFiltered(req)) {
+      if (!call.agentId || call.agentId === "unknown") continue;
       if (!map[call.agentId]) {
         map[call.agentId] = {
           agentId: call.agentId, agentName: call.agentName,
@@ -403,7 +413,7 @@ app.get("/api/calls/by-agent", async (req, res) => {
       if (call.callType === "inbound" || call.callType === "outbound") {
         map[call.agentId][call.callType]++;
       }
-      map[call.agentId].totalDuration += call.duration;
+      map[call.agentId].totalDuration += call.duration || 0;
     }
     const result = Object.values(map)
       .map((a) => ({ ...a, avgDuration: Math.round(a.totalDuration / a.total) }))
@@ -417,12 +427,12 @@ app.get("/api/calls/timeline", async (req, res) => {
     const map = {};
     for (const call of await getFiltered(req)) {
       const day = call.timestamp.slice(0, 10);
-      if (!map[day]) map[day] = { date: day, total: 0, inbound: 0, outbound: 0, totalDuration: 0 };
+      if (!map[day]) map[day] = { date: day, total: 0, inbound: 0, outbound: 0, abandoned: 0, totalDuration: 0 };
       map[day].total++;
-      map[day].totalDuration += call.duration;
-      if (call.callType === "inbound" || call.callType === "outbound") {
-        map[day][call.callType]++;
-      }
+      map[day].totalDuration += call.duration || 0;
+      if (call.abandoned)               map[day].abandoned++;
+      if (call.callType === "inbound")  map[day].inbound++;
+      if (call.callType === "outbound") map[day].outbound++;
     }
     res.json(
       Object.values(map)
@@ -433,7 +443,6 @@ app.get("/api/calls/timeline", async (req, res) => {
 });
 
 // ── Reference data ─────────────────────────────────────────────────────────
-// Agents and campaigns are derived from live cache when available.
 
 app.get("/api/agents", async (req, res) => {
   try {
@@ -458,8 +467,7 @@ app.get("/api/campaigns", async (req, res) => {
         if (c.campaignName && c.campaignName !== "Unknown" && !seen.has(c.campaignName)) {
           const mapped = _campaignTypeMap.get(c.campaignName);
           seen.set(c.campaignName, {
-            id:   c.campaignName,
-            name: c.campaignName,
+            id: c.campaignName, name: c.campaignName,
             type: mapped || c.callType,
           });
         }
@@ -500,16 +508,71 @@ app.get("/api/status", (req, res) => {
   });
 });
 
+// ══════════════════════════════════════════════════════════════════════════════
+//  NEW METRIC ROUTE GROUPS
+// ══════════════════════════════════════════════════════════════════════════════
+
+app.use(
+  "/api/metrics/agent-efficiency",
+  require("./routes/agentEfficiency")(getCalls, getAgentSessions)
+);
+
+app.use(
+  "/api/metrics/outbound",
+  require("./routes/outboundAni")(getCalls, MOCK_ANIS, MOCK_CAMPAIGNS)
+);
+
+app.use(
+  "/api/metrics/inbound",
+  require("./routes/inboundQueue")(getCalls)
+);
+
+app.use(
+  "/api/metrics/dispositions",
+  require("./routes/dispositions")(getCalls)
+);
+
 // ── Start ──────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`\nFive9 Analytics API → http://localhost:${PORT}`);
   console.log(`  Refreshing every ${REFRESH_MS / 1000}s | Cache window: ${CACHE_DAYS} days`);
-  console.log(`  GET /api/status          ← health + cache info`);
-  console.log(`  GET /api/calls`);
+  console.log(`\n  ── Existing endpoints ──`);
+  console.log(`  GET /api/status`);
+  console.log(`  GET /api/calls                        ?startDateTime &endDateTime &agent &campaign &ANI &disposition &direction`);
   console.log(`  GET /api/calls/summary`);
   console.log(`  GET /api/calls/by-campaign`);
   console.log(`  GET /api/calls/by-ani`);
   console.log(`  GET /api/calls/by-disposition`);
   console.log(`  GET /api/calls/by-agent`);
   console.log(`  GET /api/calls/timeline`);
+  console.log(`\n  ── Group 1: Agent Efficiency ──`);
+  console.log(`  GET /api/metrics/agent-efficiency/aht`);
+  console.log(`  GET /api/metrics/agent-efficiency/calls-per-hour`);
+  console.log(`  GET /api/metrics/agent-efficiency/utilization`);
+  console.log(`  GET /api/metrics/agent-efficiency/time-in-state`);
+  console.log(`  GET /api/metrics/agent-efficiency/fcr`);
+  console.log(`\n  ── Group 2: Outbound & ANI Health ──`);
+  console.log(`  GET /api/metrics/outbound/pickup-rate`);
+  console.log(`  GET /api/metrics/outbound/pickup-rate-by-ani`);
+  console.log(`  GET /api/metrics/outbound/dial-attempts-by-ani`);
+  console.log(`  GET /api/metrics/outbound/live-vs-no-answer-by-ani`);
+  console.log(`  GET /api/metrics/outbound/abandon-rate`);
+  console.log(`  GET /api/metrics/outbound/by-campaign`);
+  console.log(`  GET /api/metrics/outbound/by-campaign-type`);
+  console.log(`  GET /api/metrics/outbound/by-ani-and-campaign`);
+  console.log(`\n  ── Group 3: Inbound Queue ──`);
+  console.log(`  GET /api/metrics/inbound/median-response-time`);
+  console.log(`  GET /api/metrics/inbound/avg-speed-of-answer`);
+  console.log(`  GET /api/metrics/inbound/service-level              ?targetSeconds=30`);
+  console.log(`  GET /api/metrics/inbound/abandon-rate`);
+  console.log(`  GET /api/metrics/inbound/volume-by-marketing-number`);
+  console.log(`  GET /api/metrics/inbound/avg-queue-wait`);
+  console.log(`  GET /api/metrics/inbound/longest-wait`);
+  console.log(`\n  ── Group 4: Dispositions & Outcomes ──`);
+  console.log(`  GET /api/metrics/dispositions/conversion-rate`);
+  console.log(`  GET /api/metrics/dispositions/save-rate`);
+  console.log(`  GET /api/metrics/dispositions/outbound-breakdown`);
+  console.log(`  GET /api/metrics/dispositions/inbound-breakdown`);
+  console.log(`  GET /api/metrics/dispositions/transfer-rate`);
+  console.log(`\n  All new endpoints accept: ?startDateTime &endDateTime &agent &campaign &ANI &disposition &direction`);
 });

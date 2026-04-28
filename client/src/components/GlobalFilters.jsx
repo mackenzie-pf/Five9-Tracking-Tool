@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import { DATE_PRESETS } from "../constants/datePresets";
 
 const DIRECTIONS = [
   { value: "all",      label: "All Directions" },
@@ -6,51 +7,14 @@ const DIRECTIONS = [
   { value: "outbound", label: "Outbound Only"  },
 ];
 
-function toLocalISO(d) {
-  const pad = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
-}
-
-const QUICK_RANGES = [
-  {
-    label: "Today",
-    get() {
-      const s = new Date(); s.setHours(0,0,0,0);
-      return { start: toLocalISO(s), end: toLocalISO(new Date()) };
-    },
-  },
-  {
-    label: "Yesterday",
-    get() {
-      const s = new Date(); s.setDate(s.getDate()-1); s.setHours(0,0,0,0);
-      const e = new Date(); e.setDate(e.getDate()-1); e.setHours(23,59,0,0);
-      return { start: toLocalISO(s), end: toLocalISO(e) };
-    },
-  },
-  {
-    label: "Last 7 Days",
-    get() {
-      const s = new Date(); s.setDate(s.getDate()-6); s.setHours(0,0,0,0);
-      return { start: toLocalISO(s), end: toLocalISO(new Date()) };
-    },
-  },
-  {
-    label: "This Month",
-    get() {
-      const s = new Date(); s.setDate(1); s.setHours(0,0,0,0);
-      return { start: toLocalISO(s), end: toLocalISO(new Date()) };
-    },
-  },
-  {
-    label: "Last 30 Days",
-    get() {
-      const s = new Date(); s.setDate(s.getDate()-29); s.setHours(0,0,0,0);
-      return { start: toLocalISO(s), end: toLocalISO(new Date()) };
-    },
-  },
-];
-
-export default function GlobalFilters({ filters, refData, onUpdate, onClear }) {
+export default function GlobalFilters({
+  filters,
+  refData,
+  activePreset,
+  onUpdate,
+  onClear,
+  onApplyPreset,
+}) {
   const { agents, campaigns, anis, dispositions = [] } = refData;
 
   const chips = useMemo(() => {
@@ -73,25 +37,22 @@ export default function GlobalFilters({ filters, refData, onUpdate, onClear }) {
   const clearAll = () =>
     ["direction", "agentId", "campaignId", "ani", "disposition"].forEach(onClear);
 
-  const applyQuick = (range) => {
-    const { start, end } = range.get();
-    onUpdate("start", start);
-    onUpdate("end", end);
-  };
-
   return (
     <div className="bg-[#162032] border-b border-slate-700 px-6 py-3">
 
-      {/* ── Quick-range buttons ────────────────────────────────────── */}
+      {/* ── Date preset buttons ────────────────────────────────────── */}
       <div className="flex gap-2 mb-3 flex-wrap">
-        {QUICK_RANGES.map((r) => (
+        {DATE_PRESETS.map((p) => (
           <button
-            key={r.label}
-            onClick={() => applyQuick(r)}
-            className="text-xs px-3 py-1 rounded-full border border-slate-600 text-slate-300
-                       hover:border-teal hover:text-teal transition-colors"
+            key={p.id}
+            onClick={() => onApplyPreset(p.id)}
+            className={`text-xs px-3 py-1 rounded-full border transition-colors ${
+              activePreset === p.id
+                ? "border-teal bg-teal/10 text-teal"
+                : "border-slate-600 text-slate-300 hover:border-teal hover:text-teal"
+            }`}
           >
-            {r.label}
+            {p.label}
           </button>
         ))}
       </div>
@@ -167,7 +128,7 @@ export default function GlobalFilters({ filters, refData, onUpdate, onClear }) {
         />
       </div>
 
-      {/* ── Active chips ───────────────────────────────────────────── */}
+      {/* ── Active filter chips ────────────────────────────────────── */}
       {chips.length > 0 && (
         <div className="flex flex-wrap items-center gap-2 mt-2.5">
           <span className="text-xs text-slate-500">Active:</span>

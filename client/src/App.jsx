@@ -3,44 +3,31 @@ import GlobalFilters from "./components/GlobalFilters";
 import RealTimeTab from "./tabs/RealTimeTab";
 import AgentPerformanceTab from "./tabs/AgentPerformanceTab";
 import OutboundTrackingTab from "./tabs/OutboundTrackingTab";
+import DispositionsTab from "./tabs/DispositionsTab";
 import StrategicTrendsTab from "./tabs/StrategicTrendsTab";
+import AlertBanner from "./components/AlertBanner";
+import { useFilters } from "./hooks/useFilters";
 import { fetchAgents, fetchCampaigns, fetchANIs, fetchCallsByDisp } from "./api/client";
 import { generateWeeklyReport } from "./utils/reportGenerator";
 
 const TABS = [
-  { id: "realtime",  label: "Real-Time Operations"   },
-  { id: "outbound",  label: "Call Volume & Outbound" },
-  { id: "agents",    label: "Agent Performance"      },
-  { id: "strategic", label: "Strategic & Trends"     },
+  { id: "realtime",     label: "Real-Time Operations"    },
+  { id: "outbound",     label: "Call Volume & Outbound"  },
+  { id: "agents",       label: "Agent Performance"       },
+  { id: "dispositions", label: "Dispositions & Outcomes" },
+  { id: "strategic",    label: "Strategic & Trends"      },
 ];
-
-function nowStr() {
-  return new Date().toISOString().slice(0, 16);
-}
-function todayStartStr() {
-  const d = new Date();
-  d.setHours(0, 0, 0, 0);
-  return d.toISOString().slice(0, 16);
-}
 
 export default function App() {
   const [activeTab, setActiveTab] = useState("realtime");
-  const [time, setTime] = useState(new Date().toLocaleTimeString());
+  const [time,      setTime]      = useState(new Date().toLocaleTimeString());
 
-  const [filters, setFilters] = useState({
-    start:       todayStartStr(),
-    end:         nowStr(),
-    direction:   "all",
-    agentId:     "all",
-    campaignId:  "all",
-    ani:         "all",
-    disposition: "all",
-  });
+  const { filters, activePreset, updateFilter, clearFilter, applyPreset } = useFilters();
 
   const [refData,   setRefData]   = useState({ agents: [], campaigns: [], anis: [], dispositions: [] });
   const [pdfStatus, setPdfStatus] = useState("");
 
-  // Load reference data once
+  // Load reference data once on mount
   useEffect(() => {
     Promise.all([fetchAgents(), fetchCampaigns(), fetchANIs(), fetchCallsByDisp({})]).then(
       ([agents, campaigns, anis, disp]) =>
@@ -48,17 +35,11 @@ export default function App() {
     );
   }, []);
 
-  // Clock
+  // Live clock
   useEffect(() => {
     const id = setInterval(() => setTime(new Date().toLocaleTimeString()), 1000);
     return () => clearInterval(id);
   }, []);
-
-  const updateFilter = (key, value) =>
-    setFilters((f) => ({ ...f, [key]: value }));
-
-  const clearFilter = (key) =>
-    setFilters((f) => ({ ...f, [key]: "all" }));
 
   return (
     <div className="min-h-screen bg-navy text-white font-sans">
@@ -74,7 +55,10 @@ export default function App() {
         </div>
         <div className="flex items-center gap-3">
           {pdfStatus && (
-            <span className={`text-xs ${pdfStatus.startsWith("✓") ? "text-green-400" : pdfStatus.startsWith("Error") ? "text-red-400" : "text-slate-400"}`}>
+            <span className={`text-xs ${
+              pdfStatus.startsWith("✓")     ? "text-green-400" :
+              pdfStatus.startsWith("Error") ? "text-red-400"   : "text-slate-400"
+            }`}>
               {pdfStatus}
             </span>
           )}
@@ -105,9 +89,14 @@ export default function App() {
       <GlobalFilters
         filters={filters}
         refData={refData}
+        activePreset={activePreset}
         onUpdate={updateFilter}
         onClear={clearFilter}
+        onApplyPreset={applyPreset}
       />
+
+      {/* ── Alert Banner (only visible when threshold breaches exist) ── */}
+      <AlertBanner filters={filters} />
 
       {/* ── Tab Navigation ─────────────────────────────────────────── */}
       <div className="bg-card border-b border-slate-700 px-6">
@@ -130,10 +119,11 @@ export default function App() {
 
       {/* ── Tab Content ────────────────────────────────────────────── */}
       <main className="p-4">
-        {activeTab === "realtime"  && <RealTimeTab         filters={filters} />}
-        {activeTab === "outbound"  && <OutboundTrackingTab filters={filters} />}
-        {activeTab === "agents"    && <AgentPerformanceTab filters={filters} />}
-        {activeTab === "strategic" && <StrategicTrendsTab  filters={filters} />}
+        {activeTab === "realtime"     && <RealTimeTab         filters={filters} />}
+        {activeTab === "outbound"     && <OutboundTrackingTab filters={filters} />}
+        {activeTab === "agents"       && <AgentPerformanceTab filters={filters} />}
+        {activeTab === "dispositions" && <DispositionsTab     filters={filters} />}
+        {activeTab === "strategic"    && <StrategicTrendsTab  filters={filters} />}
       </main>
     </div>
   );

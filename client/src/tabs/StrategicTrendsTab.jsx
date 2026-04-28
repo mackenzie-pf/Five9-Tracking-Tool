@@ -4,7 +4,7 @@ import {
   XAxis, YAxis, CartesianGrid, Tooltip, Legend, Cell,
 } from "recharts";
 import { fetchSummary, fetchTimeline } from "../api/client";
-import { generateWeeklyReport } from "../utils/reportGenerator";
+import { generateWeeklyReport, generateReport } from "../utils/reportGenerator";
 
 function DarkTooltip({ active, payload, label }) {
   if (!active || !payload?.length) return null;
@@ -20,12 +20,159 @@ function DarkTooltip({ active, payload, label }) {
   );
 }
 
+// ── Custom Report Card ────────────────────────────────────────────────────────
+function CustomReportCard({ defaultStart, defaultEnd }) {
+  const [reportStart,  setReportStart]  = useState(defaultStart || "");
+  const [reportEnd,    setReportEnd]    = useState(defaultEnd   || "");
+  const [generating,   setGenerating]   = useState(false);
+  const [status,       setStatus]       = useState("");
+  const [weeklyStatus, setWeeklyStatus] = useState("");
+  const [weeklyBusy,   setWeeklyBusy]   = useState(false);
+
+  // Sync default values when parent filters change (only before user edits)
+  useEffect(() => { setReportStart(defaultStart || ""); }, [defaultStart]);
+  useEffect(() => { setReportEnd(defaultEnd || "");     }, [defaultEnd]);
+
+  const handleGenerate = async (fmt) => {
+    if (!reportStart || !reportEnd) {
+      setStatus("Please set a start and end date/time.");
+      return;
+    }
+    setGenerating(true);
+    setStatus("Fetching data…");
+    try {
+      const filename = await generateReport({
+        start:      reportStart,
+        end:        reportEnd,
+        format:     fmt,
+        title:      "Operations Report",
+        onProgress: setStatus,
+      });
+      setStatus(`✓ Saved: ${filename}`);
+      setTimeout(() => setStatus(""), 5000);
+    } catch (err) {
+      setStatus(`Error: ${err.message}`);
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  const handleWeekly = async () => {
+    setWeeklyBusy(true);
+    setWeeklyStatus("Fetching data…");
+    try {
+      const filename = await generateWeeklyReport((msg) => setWeeklyStatus(msg));
+      setWeeklyStatus(`✓ ${filename}`);
+      setTimeout(() => setWeeklyStatus(""), 5000);
+    } catch (err) {
+      setWeeklyStatus(`Error: ${err.message}`);
+    } finally {
+      setWeeklyBusy(false);
+    }
+  };
+
+  return (
+    <div className="bg-card rounded-xl border border-slate-700 p-5 space-y-5">
+      <h2 className="text-sm font-semibold text-white">Report Generator</h2>
+
+      {/* ── Weekly Report (preserved) ───────────────────────────────── */}
+      <div className="pb-4 border-b border-slate-700">
+        <p className="text-xs text-slate-400 mb-2">
+          Quick export: last 7 days as PDF — volume, campaigns, ANI health, agent scorecards.
+        </p>
+        <button
+          onClick={handleWeekly}
+          disabled={weeklyBusy}
+          className="w-full py-2 rounded-lg text-sm font-bold transition-all
+                     bg-teal text-navy hover:bg-cyan-300 active:scale-95
+                     disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {weeklyBusy ? "Generating…" : "Weekly Report (prior 7 days)"}
+        </button>
+        {weeklyStatus && (
+          <p className={`text-xs mt-1.5 text-center ${
+            weeklyStatus.startsWith("✓") ? "text-green-400"
+              : weeklyStatus.startsWith("Error") ? "text-red-400"
+              : "text-slate-400"
+          }`}>
+            {weeklyStatus}
+          </p>
+        )}
+      </div>
+
+      {/* ── Custom Date Range Report ─────────────────────────────────── */}
+      <div>
+        <h3 className="text-xs font-semibold text-slate-300 mb-3 uppercase tracking-wider">
+          Custom Date Range Report
+        </h3>
+
+        <div className="grid grid-cols-2 gap-3 mb-4">
+          <div>
+            <label className="text-xs text-slate-400 block mb-1">Start</label>
+            <input
+              type="datetime-local"
+              value={reportStart}
+              onChange={(e) => setReportStart(e.target.value)}
+              className="w-full bg-navy border border-slate-600 text-white text-xs rounded-lg px-2 py-1.5
+                         focus:border-teal outline-none [color-scheme:dark]"
+            />
+          </div>
+          <div>
+            <label className="text-xs text-slate-400 block mb-1">End</label>
+            <input
+              type="datetime-local"
+              value={reportEnd}
+              onChange={(e) => setReportEnd(e.target.value)}
+              className="w-full bg-navy border border-slate-600 text-white text-xs rounded-lg px-2 py-1.5
+                         focus:border-teal outline-none [color-scheme:dark]"
+            />
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 gap-2">
+          <button
+            onClick={() => handleGenerate("pdf")}
+            disabled={generating}
+            className="py-2 rounded-lg text-sm font-bold transition-all
+                       bg-slate-700 text-white hover:bg-slate-600 active:scale-95
+                       disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {generating ? "Building…" : "Export PDF"}
+          </button>
+          <button
+            onClick={() => handleGenerate("csv")}
+            disabled={generating}
+            className="py-2 rounded-lg text-sm font-bold transition-all
+                       bg-slate-700 text-white hover:bg-slate-600 active:scale-95
+                       disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {generating ? "Building…" : "Export CSV"}
+          </button>
+        </div>
+
+        {status && (
+          <p className={`text-xs mt-2 text-center ${
+            status.startsWith("✓") ? "text-green-400"
+              : status.startsWith("Error") ? "text-red-400"
+              : "text-slate-400"
+          }`}>
+            {status}
+          </p>
+        )}
+      </div>
+
+      <p className="text-xs text-slate-600">
+        6-section report: Volume · Agent Efficiency · Outbound &amp; ANI Health · Queue · Outcomes · Flags
+      </p>
+    </div>
+  );
+}
+
+// ── Main Tab ──────────────────────────────────────────────────────────────────
 export default function StrategicTrendsTab({ filters }) {
   const [summary,    setSummary]    = useState({ totalCalls: 0, totalInbound: 0, totalOutbound: 0, avgDuration: 0 });
   const [timeline,   setTimeline]   = useState([]);
   const [totalCost,  setTotalCost]  = useState("");
-  const [generating, setGenerating] = useState(false);
-  const [genStatus,  setGenStatus]  = useState("");
   const [loading,    setLoading]    = useState(true);
 
   useEffect(() => {
@@ -51,57 +198,93 @@ export default function StrategicTrendsTab({ filters }) {
   const costPerInbound  = costNum && summary.totalInbound  > 0 ? (costNum / summary.totalInbound).toFixed(2)  : null;
   const costPerOutbound = costNum && summary.totalOutbound > 0 ? (costNum / summary.totalOutbound).toFixed(2) : null;
 
-  // Channel mix from real data
   const channelMix = [
     { channel: "Inbound",  count: summary.totalInbound,  color: "#3B82F6" },
     { channel: "Outbound", count: summary.totalOutbound, color: "#00BCD4" },
   ];
 
-  // KPI delta cards (first vs last day in range)
   const first = chartData[0];
   const last  = chartData[chartData.length - 1];
-
-  const handleGenerate = async () => {
-    setGenerating(true);
-    setGenStatus("Fetching data…");
-    try {
-      const filename = await generateWeeklyReport((msg) => setGenStatus(msg));
-      setGenStatus(`Saved: ${filename}`);
-    } catch (err) {
-      setGenStatus(`Error: ${err.message}`);
-    } finally {
-      setGenerating(false);
-    }
-  };
 
   return (
     <div className="space-y-4">
 
+      {/* ── Row 0: Report Generator + Cost Calculator ─────────────── */}
+      <div className="grid grid-cols-2 gap-4">
+
+        {/* Custom Report Generator */}
+        <CustomReportCard
+          defaultStart={filters.start}
+          defaultEnd={filters.end}
+        />
+
+        {/* Cost Calculator */}
+        <div className="bg-card rounded-xl border border-slate-700 p-5">
+          <h2 className="text-sm font-semibold text-white mb-4">Cost Per Call Calculator</h2>
+          <label className="text-xs text-slate-400 block mb-1">Total Operating Cost for Period ($)</label>
+          <div className="flex items-center gap-2 mb-4">
+            <span className="text-slate-400 text-sm">$</span>
+            <input
+              type="number"
+              min="0"
+              value={totalCost}
+              onChange={(e) => setTotalCost(e.target.value)}
+              placeholder="e.g. 12500"
+              className="flex-1 bg-navy border border-slate-600 text-white text-sm rounded-lg px-3 py-2
+                         focus:border-teal outline-none placeholder-slate-600"
+            />
+          </div>
+
+          {costPerCall ? (
+            <div className="grid grid-cols-3 gap-3">
+              <CostMetric label="Per Call"     value={`$${costPerCall}`}     total={summary.totalCalls}    />
+              <CostMetric label="Per Inbound"  value={`$${costPerInbound}`}  total={summary.totalInbound}  />
+              <CostMetric label="Per Outbound" value={`$${costPerOutbound}`} total={summary.totalOutbound} />
+            </div>
+          ) : (
+            <p className="text-slate-500 text-xs">
+              Enter a cost to calculate cost-per-call across {summary.totalCalls.toLocaleString()} calls.
+            </p>
+          )}
+
+          <hr className="border-slate-700 my-4" />
+
+          {/* Channel Mix */}
+          <h3 className="text-xs font-semibold text-white mb-1">Call Direction Mix</h3>
+          <p className="text-xs text-slate-500 mb-3">Inbound vs outbound for selected period</p>
+          <ResponsiveContainer width="100%" height={130}>
+            <BarChart data={channelMix} margin={{ top: 5, right: 10, left: -10, bottom: 5 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#334155" vertical={false} />
+              <XAxis dataKey="channel" tick={{ fill: "#94A3B8", fontSize: 11 }} axisLine={false} tickLine={false} />
+              <YAxis tick={{ fill: "#94A3B8", fontSize: 10 }} axisLine={false} tickLine={false} />
+              <Tooltip content={<DarkTooltip />} />
+              <Bar dataKey="count" name="Calls" radius={[5, 5, 0, 0]}>
+                {channelMix.map((entry, i) => <Cell key={i} fill={entry.color} />)}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+          <div className="flex justify-around pt-2 border-t border-slate-700 mt-1">
+            {channelMix.map((ch) => {
+              const t  = channelMix.reduce((s, c) => s + c.count, 0);
+              const p  = t > 0 ? ((ch.count / t) * 100).toFixed(0) : 0;
+              return (
+                <div key={ch.channel} className="text-center">
+                  <p className="text-lg font-bold" style={{ color: ch.color }}>{ch.count.toLocaleString()}</p>
+                  <p className="text-xs text-slate-400">{ch.channel}</p>
+                  <p className="text-xs text-slate-500">{p}%</p>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+
       {/* ── Row 1: Trend KPI cards ─────────────────────────────────── */}
       {chartData.length >= 2 && (
         <div className="grid grid-cols-3 gap-4">
-          <TrendCard
-            label="Total Calls"
-            current={last?.total ?? 0}
-            previous={first?.total ?? 0}
-            color="#00BCD4"
-            note={`${chartData.length}-day range`}
-          />
-          <TrendCard
-            label="Outbound Calls"
-            current={last?.outbound ?? 0}
-            previous={first?.outbound ?? 0}
-            color="#8B5CF6"
-            note={`${chartData.length}-day range`}
-          />
-          <TrendCard
-            label="Avg Handle Time"
-            current={last?.aht ?? 0}
-            previous={first?.aht ?? 0}
-            color="#22C55E"
-            note="seconds · lower is better"
-            lowerIsBetter
-          />
+          <TrendCard label="Total Calls"     current={last?.total ?? 0}   previous={first?.total ?? 0}   color="#00BCD4" note={`${chartData.length}-day range`} />
+          <TrendCard label="Outbound Calls"  current={last?.outbound ?? 0} previous={first?.outbound ?? 0} color="#8B5CF6" note={`${chartData.length}-day range`} />
+          <TrendCard label="Avg Handle Time" current={last?.aht ?? 0}     previous={first?.aht ?? 0}     color="#22C55E" note="seconds · lower is better" lowerIsBetter />
         </div>
       )}
 
@@ -148,93 +331,6 @@ export default function StrategicTrendsTab({ filters }) {
               </LineChart>
             </ResponsiveContainer>
           ) : <EmptyChart loading={loading} />}
-        </div>
-      </div>
-
-      {/* ── Row 3: Cost Calculator + Channel Mix ──────────────────── */}
-      <div className="grid grid-cols-2 gap-4">
-
-        {/* Cost calculator */}
-        <div className="bg-card rounded-xl border border-slate-700 p-5">
-          <h2 className="text-sm font-semibold text-white mb-4">Cost Per Call Calculator</h2>
-          <label className="text-xs text-slate-400 block mb-1">Total Operating Cost for Period ($)</label>
-          <div className="flex items-center gap-2 mb-4">
-            <span className="text-slate-400 text-sm">$</span>
-            <input
-              type="number"
-              min="0"
-              value={totalCost}
-              onChange={(e) => setTotalCost(e.target.value)}
-              placeholder="e.g. 12500"
-              className="flex-1 bg-navy border border-slate-600 text-white text-sm rounded-lg px-3 py-2
-                         focus:border-teal outline-none placeholder-slate-600"
-            />
-          </div>
-
-          {costPerCall ? (
-            <div className="grid grid-cols-3 gap-3 mb-4">
-              <CostMetric label="Per Call"     value={`$${costPerCall}`}     total={summary.totalCalls}    />
-              <CostMetric label="Per Inbound"  value={`$${costPerInbound}`}  total={summary.totalInbound}  />
-              <CostMetric label="Per Outbound" value={`$${costPerOutbound}`} total={summary.totalOutbound} />
-            </div>
-          ) : (
-            <p className="text-slate-500 text-xs mb-4">
-              Enter a cost to calculate cost-per-call across {summary.totalCalls.toLocaleString()} calls.
-            </p>
-          )}
-
-          <hr className="border-slate-700 mb-4" />
-          <h3 className="text-xs text-slate-400 uppercase tracking-wider mb-2">Weekly Report</h3>
-          <p className="text-xs text-slate-500 mb-3">
-            Exports a PDF covering the prior 7 days — volume, campaigns, ANI health, agent scorecards.
-          </p>
-          <button
-            onClick={handleGenerate}
-            disabled={generating}
-            className="w-full py-2.5 rounded-lg text-sm font-bold transition-all
-                       bg-teal text-navy hover:bg-cyan-300 active:scale-95
-                       disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            {generating ? "Generating PDF…" : "Generate Weekly Report"}
-          </button>
-          {genStatus && (
-            <p className={`text-xs mt-2 text-center ${genStatus.startsWith("Saved") ? "text-green-400" : genStatus.startsWith("Error") ? "text-red-400" : "text-slate-400"}`}>
-              {genStatus}
-            </p>
-          )}
-        </div>
-
-        {/* Channel mix — real inbound/outbound split */}
-        <div className="bg-card rounded-xl border border-slate-700 p-5">
-          <h2 className="text-sm font-semibold text-white mb-1">Call Direction Mix</h2>
-          <p className="text-xs text-slate-500 mb-4">Inbound vs outbound for selected period</p>
-          <ResponsiveContainer width="100%" height={180}>
-            <BarChart data={channelMix} margin={{ top: 5, right: 10, left: -10, bottom: 5 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#334155" vertical={false} />
-              <XAxis dataKey="channel" tick={{ fill: "#94A3B8", fontSize: 12 }} axisLine={false} tickLine={false} />
-              <YAxis tick={{ fill: "#94A3B8", fontSize: 11 }} axisLine={false} tickLine={false} />
-              <Tooltip content={<DarkTooltip />} />
-              <Bar dataKey="count" name="Calls" radius={[6, 6, 0, 0]}>
-                {channelMix.map((entry, i) => (
-                  <Cell key={i} fill={entry.color} />
-                ))}
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
-
-          <div className="flex justify-around pt-3 border-t border-slate-700 mt-2">
-            {channelMix.map((ch) => {
-              const t = channelMix.reduce((s, c) => s + c.count, 0);
-              const pct = t > 0 ? ((ch.count / t) * 100).toFixed(0) : 0;
-              return (
-                <div key={ch.channel} className="text-center">
-                  <p className="text-xl font-bold" style={{ color: ch.color }}>{ch.count.toLocaleString()}</p>
-                  <p className="text-xs text-slate-400">{ch.channel}</p>
-                  <p className="text-xs text-slate-500">{pct}%</p>
-                </div>
-              );
-            })}
-          </div>
         </div>
       </div>
     </div>

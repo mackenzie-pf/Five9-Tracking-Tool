@@ -1,7 +1,14 @@
-// data/mockData.js
-// Structured so every array can be swapped for a PostgreSQL query later.
-// callType is deliberately absent from call records — it is derived at
-// runtime by the backend classification rules in server.js.
+// server/data/mockData.js
+// Extended schema supporting all operational KPIs.
+// Every array/function can be swapped for a PostgreSQL query without touching route logic.
+//
+// OUTBOUND CLASSIFICATION RULE (enforced everywhere):
+//   A call is outbound if:
+//   (1) its ANI is in outboundANIs, OR
+//   (2) its campaignName is in a campaign with type === "outbound"
+// callType is derived at runtime by server.js; not stored here.
+
+// ── Reference data ─────────────────────────────────────────────────────────
 
 const agents = [
   { id: "agent_1", name: "Sarah Johnson",   role: "Patient Coordinator",   extension: "1001" },
@@ -12,112 +19,950 @@ const agents = [
   { id: "agent_6", name: "James Martinez",  role: "Outreach Specialist",   extension: "1006" },
 ];
 
-// Numbers owned by the organization and used as outbound caller IDs.
-// Rule 1: any call whose ANI matches an entry here is classified as outbound.
+// Rule 1: any call whose ANI matches here is outbound.
 const outboundANIs = [
-  { number: "+18662141522", label: "Sales Line A"  },
-  { number: "+18662141523", label: "Sales Line B"  },
+  { number: "+18662141522", label: "Sales Line A"   },
+  { number: "+18662141523", label: "Sales Line B"   },
   { number: "+18559871100", label: "Follow-up Line" },
 ];
 
-// Rule 2: any call whose campaignName matches an outbound campaign is classified
-// as outbound, even if its ANI is null (manual dial, no auto-flagging).
+// Rule 2: any call whose campaignName matches an outbound campaign here is outbound.
 const campaigns = [
-  { id: "camp_ob1", name: "Weight Loss Outreach",    type: "outbound" },
-  { id: "camp_ob2", name: "Follow-Up Campaign",      type: "outbound" },
-  { id: "camp_ob3", name: "Prescription Renewal",    type: "outbound" },
-  { id: "camp_ob4", name: "New Patient Acquisition", type: "outbound" },
-  { id: "camp_ob5", name: "Re-engagement Campaign",  type: "outbound" },
-  { id: "camp_ib1", name: "Patient Support",         type: "inbound"  },
-  { id: "camp_ib2", name: "Appointment Scheduling",  type: "inbound"  },
-  { id: "camp_ib3", name: "General Inquiry",         type: "inbound"  },
-  { id: "camp_ib4", name: "Insurance Verification",  type: "inbound"  },
+  { id: "camp_ob1", name: "Weight Loss Outreach",    type: "outbound", dialerType: "preview"    },
+  { id: "camp_ob2", name: "Follow-Up Campaign",      type: "outbound", dialerType: "progressive" },
+  { id: "camp_ob3", name: "Prescription Renewal",    type: "outbound", dialerType: "progressive" },
+  { id: "camp_ob4", name: "New Patient Acquisition", type: "outbound", dialerType: "predictive"  },
+  { id: "camp_ob5", name: "Re-engagement Campaign",  type: "outbound", dialerType: "preview"    },
+  { id: "camp_ib1", name: "Patient Support",         type: "inbound",  dialerType: null          },
+  { id: "camp_ib2", name: "Appointment Scheduling",  type: "inbound",  dialerType: null          },
+  { id: "camp_ib3", name: "General Inquiry",         type: "inbound",  dialerType: null          },
+  { id: "camp_ib4", name: "Insurance Verification",  type: "inbound",  dialerType: null          },
 ];
 
-// 55 calls spread across two weeks (2026-04-08 → 2026-04-22).
-// Calls with ani: null are manual dials — classified via campaign name (Rule 2).
+// ── Deterministic PRNG for mock session data ───────────────────────────────
+// Mulberry32 — fast, seedable, always produces the same sequence.
+function mulberry32(seed) {
+  return function () {
+    seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rng = mulberry32(42);
+const vary = (base, lo = 0.85, hi = 1.15) => Math.round(base * (lo + rng() * (hi - lo)));
+
+// ── Calls ──────────────────────────────────────────────────────────────────
+// New fields per call:
+//   talkTimeSeconds      – agent actively speaking
+//   holdTimeSeconds      – caller placed on hold
+//   wrapUpTimeSeconds    – after-call work
+//   queueWaitSeconds     – time in queue before agent pickup (inbound); 0 for outbound
+//   answeredWithinThreshold – bool (queueWait <= 30 s); null for outbound
+//   pickupFlag           – outbound: did prospect answer? null for inbound
+//   conversionFlag       – outbound: did call result in a new subscription?
+//   saveFlag             – was a cancellation attempt retained?
+//   transferred          – was the call transferred to another agent/team?
+//   escalatedToClinical  – escalated to nurse / clinical team?
+//   campaignType         – "outbound" | "inbound" (denormalised for fast filtering)
+//   dialedMarketingNumber – inbound DNIS (the number the customer dialed); null for outbound
+//   contactAttemptNumber – which attempt number for this contact (1-based)
+//   abandoned            – caller/dialer abandoned before agent handled (false for normal calls)
+
 const calls = [
 
-  // ── April 8 (Tuesday) ───────────────────────────────────────────────────
-  { id:"c001", timestamp:"2026-04-08T09:15:22", ani:"+18662141522", dnis:"+13055559001", agentId:"agent_2", agentName:"Mike Chen",       campaignId:"camp_ob1", campaignName:"Weight Loss Outreach",    duration:245, disposition:"Appointment Scheduled" },
-  { id:"c002", timestamp:"2026-04-08T10:32:44", ani:"+13055551234", dnis:"+18005550100", agentId:"agent_1", agentName:"Sarah Johnson",   campaignId:"camp_ib1", campaignName:"Patient Support",         duration:180, disposition:"Transferred to Nurse"   },
-  { id:"c003", timestamp:"2026-04-08T13:45:10", ani:"+18662141523", dnis:"+17865552211", agentId:"agent_6", agentName:"James Martinez",  campaignId:"camp_ob4", campaignName:"New Patient Acquisition", duration: 90, disposition:"No Answer"              },
-  { id:"c004", timestamp:"2026-04-08T15:20:33", ani:"+17865559876", dnis:"+18005550101", agentId:"agent_3", agentName:"Emily Rodriguez", campaignId:"camp_ib2", campaignName:"Appointment Scheduling",  duration:320, disposition:"Appointment Scheduled" },
+  // ── April 8 ──────────────────────────────────────────────────────────────
+  {
+    id:"c001", timestamp:"2026-04-08T09:15:22",
+    ani:"+18662141522", dnis:"+13055559001",
+    agentId:"agent_2", agentName:"Mike Chen",
+    campaignId:"camp_ob1", campaignName:"Weight Loss Outreach", campaignType:"outbound",
+    duration:245, disposition:"Appointment Scheduled",
+    talkTimeSeconds:160, holdTimeSeconds:20, wrapUpTimeSeconds:65,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:true, conversionFlag:true, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c002", timestamp:"2026-04-08T10:32:44",
+    ani:"+13055551234", dnis:"+18005550100",
+    agentId:"agent_1", agentName:"Sarah Johnson",
+    campaignId:"camp_ib1", campaignName:"Patient Support", campaignType:"inbound",
+    duration:180, disposition:"Transferred to Nurse",
+    talkTimeSeconds:115, holdTimeSeconds:18, wrapUpTimeSeconds:47,
+    queueWaitSeconds:22, answeredWithinThreshold:true,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:true, escalatedToClinical:true,
+    dialedMarketingNumber:"+18005550100", contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c003", timestamp:"2026-04-08T13:45:10",
+    ani:"+18662141523", dnis:"+17865552211",
+    agentId:"agent_6", agentName:"James Martinez",
+    campaignId:"camp_ob4", campaignName:"New Patient Acquisition", campaignType:"outbound",
+    duration:90, disposition:"No Answer",
+    talkTimeSeconds:0, holdTimeSeconds:0, wrapUpTimeSeconds:90,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:false, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:2, abandoned:false,
+  },
+  {
+    id:"c004", timestamp:"2026-04-08T15:20:33",
+    ani:"+17865559876", dnis:"+18005550101",
+    agentId:"agent_3", agentName:"Emily Rodriguez",
+    campaignId:"camp_ib2", campaignName:"Appointment Scheduling", campaignType:"inbound",
+    duration:320, disposition:"Appointment Scheduled",
+    talkTimeSeconds:205, holdTimeSeconds:30, wrapUpTimeSeconds:85,
+    queueWaitSeconds:35, answeredWithinThreshold:false,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:"+18005550101", contactAttemptNumber:1, abandoned:false,
+  },
 
-  // ── April 9 (Wednesday) ─────────────────────────────────────────────────
-  { id:"c005", timestamp:"2026-04-09T09:01:55", ani:"+18559871100", dnis:"+13055557788", agentId:"agent_4", agentName:"David Williams",  campaignId:"camp_ob2", campaignName:"Follow-Up Campaign",      duration:410, disposition:"Prescription Sent"      },
-  { id:"c006", timestamp:"2026-04-09T11:30:00", ani:"+13055558765", dnis:"+18005550100", agentId:"agent_1", agentName:"Sarah Johnson",   campaignId:"camp_ib3", campaignName:"General Inquiry",         duration:125, disposition:"Callback Requested"     },
-  // Manual dial — ANI is null, classified outbound via campaign name (Rule 2)
-  { id:"c007", timestamp:"2026-04-09T14:15:20", ani:null,           dnis:"+13055554433", agentId:"agent_6", agentName:"James Martinez",  campaignId:"camp_ob5", campaignName:"Re-engagement Campaign",  duration:185, disposition:"Not Interested"         },
+  // ── April 9 ──────────────────────────────────────────────────────────────
+  {
+    id:"c005", timestamp:"2026-04-09T09:01:55",
+    ani:"+18559871100", dnis:"+13055557788",
+    agentId:"agent_4", agentName:"David Williams",
+    campaignId:"camp_ob2", campaignName:"Follow-Up Campaign", campaignType:"outbound",
+    duration:410, disposition:"Prescription Sent",
+    talkTimeSeconds:265, holdTimeSeconds:35, wrapUpTimeSeconds:110,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:true, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c006", timestamp:"2026-04-09T11:30:00",
+    ani:"+13055558765", dnis:"+18005550100",
+    agentId:"agent_1", agentName:"Sarah Johnson",
+    campaignId:"camp_ib3", campaignName:"General Inquiry", campaignType:"inbound",
+    duration:125, disposition:"Billing Inquiry",
+    talkTimeSeconds:80, holdTimeSeconds:12, wrapUpTimeSeconds:33,
+    queueWaitSeconds:18, answeredWithinThreshold:true,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:"+18005550100", contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c007", timestamp:"2026-04-09T14:15:20",
+    ani:null, dnis:"+13055554433",
+    agentId:"agent_6", agentName:"James Martinez",
+    campaignId:"camp_ob5", campaignName:"Re-engagement Campaign", campaignType:"outbound",
+    duration:185, disposition:"Not Interested",
+    talkTimeSeconds:120, holdTimeSeconds:0, wrapUpTimeSeconds:65,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:true, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:1, abandoned:false,
+  },
 
-  // ── April 10 (Thursday) ─────────────────────────────────────────────────
-  { id:"c008", timestamp:"2026-04-10T08:45:00", ani:"+18662141522", dnis:"+13055551122", agentId:"agent_2", agentName:"Mike Chen",       campaignId:"camp_ob1", campaignName:"Weight Loss Outreach",    duration:300, disposition:"Appointment Scheduled" },
-  { id:"c009", timestamp:"2026-04-10T09:55:30", ani:"+13055553344", dnis:"+18005550102", agentId:"agent_5", agentName:"Ashley Brown",    campaignId:"camp_ib4", campaignName:"Insurance Verification",  duration:540, disposition:"Transferred to Nurse"   },
-  { id:"c010", timestamp:"2026-04-10T11:10:15", ani:"+18559871100", dnis:"+17865556677", agentId:"agent_4", agentName:"David Williams",  campaignId:"camp_ob3", campaignName:"Prescription Renewal",    duration:220, disposition:"Prescription Sent"      },
-  { id:"c011", timestamp:"2026-04-10T13:25:42", ani:"+17865554321", dnis:"+18005550100", agentId:"agent_3", agentName:"Emily Rodriguez", campaignId:"camp_ib2", campaignName:"Appointment Scheduling",  duration:195, disposition:"Appointment Scheduled" },
-  { id:"c012", timestamp:"2026-04-10T15:50:09", ani:"+18662141523", dnis:"+13055558899", agentId:"agent_6", agentName:"James Martinez",  campaignId:"camp_ob4", campaignName:"New Patient Acquisition", duration: 55, disposition:"No Answer"              },
+  // ── April 10 ─────────────────────────────────────────────────────────────
+  {
+    id:"c008", timestamp:"2026-04-10T08:45:00",
+    ani:"+18662141522", dnis:"+13055551122",
+    agentId:"agent_2", agentName:"Mike Chen",
+    campaignId:"camp_ob1", campaignName:"Weight Loss Outreach", campaignType:"outbound",
+    duration:300, disposition:"Appointment Scheduled",
+    talkTimeSeconds:195, holdTimeSeconds:25, wrapUpTimeSeconds:80,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:true, conversionFlag:true, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c009", timestamp:"2026-04-10T09:55:30",
+    ani:"+13055553344", dnis:"+18005550102",
+    agentId:"agent_5", agentName:"Ashley Brown",
+    campaignId:"camp_ib4", campaignName:"Insurance Verification", campaignType:"inbound",
+    duration:540, disposition:"Transferred to Nurse",
+    talkTimeSeconds:350, holdTimeSeconds:55, wrapUpTimeSeconds:135,
+    queueWaitSeconds:45, answeredWithinThreshold:false,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:true, escalatedToClinical:true,
+    dialedMarketingNumber:"+18005550102", contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c010", timestamp:"2026-04-10T11:10:15",
+    ani:"+18559871100", dnis:"+17865556677",
+    agentId:"agent_4", agentName:"David Williams",
+    campaignId:"camp_ob3", campaignName:"Prescription Renewal", campaignType:"outbound",
+    duration:220, disposition:"Prescription Sent",
+    talkTimeSeconds:142, holdTimeSeconds:18, wrapUpTimeSeconds:60,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:true, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c011", timestamp:"2026-04-10T13:25:42",
+    ani:"+17865554321", dnis:"+18005550100",
+    agentId:"agent_3", agentName:"Emily Rodriguez",
+    campaignId:"camp_ib2", campaignName:"Appointment Scheduling", campaignType:"inbound",
+    duration:195, disposition:"Appointment Scheduled",
+    talkTimeSeconds:125, holdTimeSeconds:20, wrapUpTimeSeconds:50,
+    queueWaitSeconds:28, answeredWithinThreshold:true,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:"+18005550100", contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c012", timestamp:"2026-04-10T15:50:09",
+    ani:"+18662141523", dnis:"+13055558899",
+    agentId:"agent_6", agentName:"James Martinez",
+    campaignId:"camp_ob4", campaignName:"New Patient Acquisition", campaignType:"outbound",
+    duration:55, disposition:"No Answer",
+    talkTimeSeconds:0, holdTimeSeconds:0, wrapUpTimeSeconds:55,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:false, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:3, abandoned:false,
+  },
 
-  // ── April 11 (Friday) ───────────────────────────────────────────────────
-  { id:"c013", timestamp:"2026-04-11T09:30:00", ani:"+18662141522", dnis:"+13055552233", agentId:"agent_2", agentName:"Mike Chen",       campaignId:"camp_ob1", campaignName:"Weight Loss Outreach",    duration:380, disposition:"Appointment Scheduled" },
-  { id:"c014", timestamp:"2026-04-11T10:45:22", ani:"+13055556677", dnis:"+18005550101", agentId:"agent_1", agentName:"Sarah Johnson",   campaignId:"camp_ib1", campaignName:"Patient Support",         duration:265, disposition:"Callback Requested"     },
-  // Manual dial — classified outbound via campaign name (Rule 2)
-  { id:"c015", timestamp:"2026-04-11T13:00:00", ani:null,           dnis:"+17865551122", agentId:"agent_4", agentName:"David Williams",  campaignId:"camp_ob2", campaignName:"Follow-Up Campaign",      duration:490, disposition:"Prescription Sent"      },
-  { id:"c016", timestamp:"2026-04-11T16:10:55", ani:"+17865558765", dnis:"+18005550100", agentId:"agent_5", agentName:"Ashley Brown",    campaignId:"camp_ib4", campaignName:"Insurance Verification",  duration:310, disposition:"Transferred to Nurse"   },
+  // ── April 11 ─────────────────────────────────────────────────────────────
+  {
+    id:"c013", timestamp:"2026-04-11T09:30:00",
+    ani:"+18662141522", dnis:"+13055552233",
+    agentId:"agent_2", agentName:"Mike Chen",
+    campaignId:"camp_ob1", campaignName:"Weight Loss Outreach", campaignType:"outbound",
+    duration:380, disposition:"Appointment Scheduled",
+    talkTimeSeconds:245, holdTimeSeconds:32, wrapUpTimeSeconds:103,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:true, conversionFlag:true, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c014", timestamp:"2026-04-11T10:45:22",
+    ani:"+13055556677", dnis:"+18005550101",
+    agentId:"agent_1", agentName:"Sarah Johnson",
+    campaignId:"camp_ib1", campaignName:"Patient Support", campaignType:"inbound",
+    duration:265, disposition:"Billing Inquiry",
+    talkTimeSeconds:170, holdTimeSeconds:26, wrapUpTimeSeconds:69,
+    queueWaitSeconds:33, answeredWithinThreshold:false,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:"+18005550101", contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c015", timestamp:"2026-04-11T13:00:00",
+    ani:null, dnis:"+17865551122",
+    agentId:"agent_4", agentName:"David Williams",
+    campaignId:"camp_ob2", campaignName:"Follow-Up Campaign", campaignType:"outbound",
+    duration:490, disposition:"Prescription Sent",
+    talkTimeSeconds:318, holdTimeSeconds:40, wrapUpTimeSeconds:132,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:true, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c016", timestamp:"2026-04-11T16:10:55",
+    ani:"+17865558765", dnis:"+18005550102",
+    agentId:"agent_5", agentName:"Ashley Brown",
+    campaignId:"camp_ib4", campaignName:"Insurance Verification", campaignType:"inbound",
+    duration:310, disposition:"Transferred to Nurse",
+    talkTimeSeconds:200, holdTimeSeconds:31, wrapUpTimeSeconds:79,
+    queueWaitSeconds:25, answeredWithinThreshold:true,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:true, escalatedToClinical:true,
+    dialedMarketingNumber:"+18005550102", contactAttemptNumber:1, abandoned:false,
+  },
 
-  // ── April 14 (Monday) ───────────────────────────────────────────────────
-  { id:"c017", timestamp:"2026-04-14T08:30:10", ani:"+18662141522", dnis:"+13055554455", agentId:"agent_2", agentName:"Mike Chen",       campaignId:"camp_ob1", campaignName:"Weight Loss Outreach",    duration:205, disposition:"Voicemail Left"         },
-  { id:"c018", timestamp:"2026-04-14T09:45:30", ani:"+13055559988", dnis:"+18005550100", agentId:"agent_1", agentName:"Sarah Johnson",   campaignId:"camp_ib2", campaignName:"Appointment Scheduling",  duration:445, disposition:"Appointment Scheduled" },
-  { id:"c019", timestamp:"2026-04-14T11:00:00", ani:"+18559871100", dnis:"+13055551199", agentId:"agent_4", agentName:"David Williams",  campaignId:"camp_ob3", campaignName:"Prescription Renewal",    duration:330, disposition:"Prescription Sent"      },
-  { id:"c020", timestamp:"2026-04-14T13:30:45", ani:"+18662141523", dnis:"+17865553344", agentId:"agent_6", agentName:"James Martinez",  campaignId:"camp_ob4", campaignName:"New Patient Acquisition", duration:175, disposition:"Not Interested"         },
-  { id:"c021", timestamp:"2026-04-14T15:45:00", ani:"+13055557890", dnis:"+18005550101", agentId:"agent_3", agentName:"Emily Rodriguez", campaignId:"camp_ib3", campaignName:"General Inquiry",         duration:240, disposition:"Callback Requested"     },
+  // ── April 14 ─────────────────────────────────────────────────────────────
+  {
+    id:"c017", timestamp:"2026-04-14T08:30:10",
+    ani:"+18662141522", dnis:"+13055554455",
+    agentId:"agent_2", agentName:"Mike Chen",
+    campaignId:"camp_ob1", campaignName:"Weight Loss Outreach", campaignType:"outbound",
+    duration:205, disposition:"Voicemail Left",
+    talkTimeSeconds:60, holdTimeSeconds:0, wrapUpTimeSeconds:145,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:false, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:2, abandoned:false,
+  },
+  {
+    id:"c018", timestamp:"2026-04-14T09:45:30",
+    ani:"+13055559988", dnis:"+18005550100",
+    agentId:"agent_1", agentName:"Sarah Johnson",
+    campaignId:"camp_ib2", campaignName:"Appointment Scheduling", campaignType:"inbound",
+    duration:445, disposition:"Appointment Scheduled",
+    talkTimeSeconds:288, holdTimeSeconds:44, wrapUpTimeSeconds:113,
+    queueWaitSeconds:15, answeredWithinThreshold:true,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:"+18005550100", contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c019", timestamp:"2026-04-14T11:00:00",
+    ani:"+18559871100", dnis:"+13055551199",
+    agentId:"agent_4", agentName:"David Williams",
+    campaignId:"camp_ob3", campaignName:"Prescription Renewal", campaignType:"outbound",
+    duration:330, disposition:"Prescription Sent",
+    talkTimeSeconds:214, holdTimeSeconds:28, wrapUpTimeSeconds:88,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:true, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c020", timestamp:"2026-04-14T13:30:45",
+    ani:"+18662141523", dnis:"+17865553344",
+    agentId:"agent_6", agentName:"James Martinez",
+    campaignId:"camp_ob4", campaignName:"New Patient Acquisition", campaignType:"outbound",
+    duration:175, disposition:"Not Interested",
+    talkTimeSeconds:113, holdTimeSeconds:0, wrapUpTimeSeconds:62,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:true, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:2, abandoned:false,
+  },
+  {
+    id:"c021", timestamp:"2026-04-14T15:45:00",
+    ani:"+13055557890", dnis:"+18005550101",
+    agentId:"agent_3", agentName:"Emily Rodriguez",
+    campaignId:"camp_ib3", campaignName:"General Inquiry", campaignType:"inbound",
+    duration:240, disposition:"Medical Question",
+    talkTimeSeconds:155, holdTimeSeconds:24, wrapUpTimeSeconds:61,
+    queueWaitSeconds:40, answeredWithinThreshold:false,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:"+18005550101", contactAttemptNumber:1, abandoned:false,
+  },
 
-  // ── April 15 (Tuesday) ──────────────────────────────────────────────────
-  { id:"c022", timestamp:"2026-04-15T08:55:00", ani:"+18662141522", dnis:"+13055556688", agentId:"agent_2", agentName:"Mike Chen",       campaignId:"camp_ob1", campaignName:"Weight Loss Outreach",    duration:415, disposition:"Appointment Scheduled" },
-  { id:"c023", timestamp:"2026-04-15T10:10:22", ani:"+17865552233", dnis:"+18005550102", agentId:"agent_5", agentName:"Ashley Brown",    campaignId:"camp_ib4", campaignName:"Insurance Verification",  duration:580, disposition:"Transferred to Nurse"   },
-  { id:"c024", timestamp:"2026-04-15T11:20:45", ani:"+18559871100", dnis:"+13055554466", agentId:"agent_4", agentName:"David Williams",  campaignId:"camp_ob2", campaignName:"Follow-Up Campaign",      duration:270, disposition:"Appointment Scheduled" },
-  { id:"c025", timestamp:"2026-04-15T13:05:10", ani:"+13055553322", dnis:"+18005550100", agentId:"agent_1", agentName:"Sarah Johnson",   campaignId:"camp_ib1", campaignName:"Patient Support",         duration:155, disposition:"Transferred to Nurse"   },
-  // Manual dial — classified outbound via campaign name (Rule 2)
-  { id:"c026", timestamp:"2026-04-15T14:30:00", ani:null,           dnis:"+13055551177", agentId:"agent_6", agentName:"James Martinez",  campaignId:"camp_ob5", campaignName:"Re-engagement Campaign",  duration:220, disposition:"Already a Patient"      },
-  { id:"c027", timestamp:"2026-04-15T16:00:30", ani:"+18662141523", dnis:"+17865556655", agentId:"agent_2", agentName:"Mike Chen",       campaignId:"camp_ob4", campaignName:"New Patient Acquisition", duration: 65, disposition:"No Answer"              },
+  // ── April 15 ─────────────────────────────────────────────────────────────
+  {
+    id:"c022", timestamp:"2026-04-15T08:55:00",
+    ani:"+18662141522", dnis:"+13055556688",
+    agentId:"agent_2", agentName:"Mike Chen",
+    campaignId:"camp_ob1", campaignName:"Weight Loss Outreach", campaignType:"outbound",
+    duration:415, disposition:"Appointment Scheduled",
+    talkTimeSeconds:268, holdTimeSeconds:35, wrapUpTimeSeconds:112,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:true, conversionFlag:true, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c023", timestamp:"2026-04-15T10:10:22",
+    ani:"+17865552233", dnis:"+18005550102",
+    agentId:"agent_5", agentName:"Ashley Brown",
+    campaignId:"camp_ib4", campaignName:"Insurance Verification", campaignType:"inbound",
+    duration:580, disposition:"Transferred to Nurse",
+    talkTimeSeconds:375, holdTimeSeconds:58, wrapUpTimeSeconds:147,
+    queueWaitSeconds:55, answeredWithinThreshold:false,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:true, escalatedToClinical:true,
+    dialedMarketingNumber:"+18005550102", contactAttemptNumber:2, abandoned:false,
+  },
+  {
+    id:"c024", timestamp:"2026-04-15T11:20:45",
+    ani:"+18559871100", dnis:"+13055554466",
+    agentId:"agent_4", agentName:"David Williams",
+    campaignId:"camp_ob2", campaignName:"Follow-Up Campaign", campaignType:"outbound",
+    duration:270, disposition:"Appointment Scheduled",
+    talkTimeSeconds:175, holdTimeSeconds:22, wrapUpTimeSeconds:73,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:true, conversionFlag:true, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c025", timestamp:"2026-04-15T13:05:10",
+    ani:"+13055553322", dnis:"+18005550100",
+    agentId:"agent_1", agentName:"Sarah Johnson",
+    campaignId:"camp_ib1", campaignName:"Patient Support", campaignType:"inbound",
+    duration:155, disposition:"Transferred to Nurse",
+    talkTimeSeconds:100, holdTimeSeconds:15, wrapUpTimeSeconds:40,
+    queueWaitSeconds:12, answeredWithinThreshold:true,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:true, escalatedToClinical:true,
+    dialedMarketingNumber:"+18005550100", contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c026", timestamp:"2026-04-15T14:30:00",
+    ani:null, dnis:"+13055551177",
+    agentId:"agent_6", agentName:"James Martinez",
+    campaignId:"camp_ob5", campaignName:"Re-engagement Campaign", campaignType:"outbound",
+    duration:220, disposition:"Already a Patient",
+    talkTimeSeconds:142, holdTimeSeconds:0, wrapUpTimeSeconds:78,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:true, conversionFlag:false, saveFlag:true,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c027", timestamp:"2026-04-15T16:00:30",
+    ani:"+18662141523", dnis:"+17865556655",
+    agentId:"agent_2", agentName:"Mike Chen",
+    campaignId:"camp_ob4", campaignName:"New Patient Acquisition", campaignType:"outbound",
+    duration:65, disposition:"No Answer",
+    talkTimeSeconds:0, holdTimeSeconds:0, wrapUpTimeSeconds:65,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:false, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:3, abandoned:false,
+  },
 
-  // ── April 16 (Wednesday) ────────────────────────────────────────────────
-  { id:"c028", timestamp:"2026-04-16T09:00:00", ani:"+13055558833", dnis:"+18005550100", agentId:"agent_3", agentName:"Emily Rodriguez", campaignId:"camp_ib2", campaignName:"Appointment Scheduling",  duration:395, disposition:"Appointment Scheduled" },
-  { id:"c029", timestamp:"2026-04-16T10:30:15", ani:"+18559871100", dnis:"+13055552255", agentId:"agent_4", agentName:"David Williams",  campaignId:"camp_ob3", campaignName:"Prescription Renewal",    duration:285, disposition:"Prescription Sent"      },
-  { id:"c030", timestamp:"2026-04-16T12:45:33", ani:"+17865559900", dnis:"+18005550101", agentId:"agent_5", agentName:"Ashley Brown",    campaignId:"camp_ib1", campaignName:"Patient Support",         duration:210, disposition:"Callback Requested"     },
-  { id:"c031", timestamp:"2026-04-16T15:00:00", ani:"+18662141522", dnis:"+13055557766", agentId:"agent_2", agentName:"Mike Chen",       campaignId:"camp_ob1", campaignName:"Weight Loss Outreach",    duration:330, disposition:"Appointment Scheduled" },
+  // ── April 16 ─────────────────────────────────────────────────────────────
+  {
+    id:"c028", timestamp:"2026-04-16T09:00:00",
+    ani:"+13055558833", dnis:"+18005550100",
+    agentId:"agent_3", agentName:"Emily Rodriguez",
+    campaignId:"camp_ib2", campaignName:"Appointment Scheduling", campaignType:"inbound",
+    duration:395, disposition:"Appointment Scheduled",
+    talkTimeSeconds:255, holdTimeSeconds:40, wrapUpTimeSeconds:100,
+    queueWaitSeconds:20, answeredWithinThreshold:true,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:"+18005550100", contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c029", timestamp:"2026-04-16T10:30:15",
+    ani:"+18559871100", dnis:"+13055552255",
+    agentId:"agent_4", agentName:"David Williams",
+    campaignId:"camp_ob3", campaignName:"Prescription Renewal", campaignType:"outbound",
+    duration:285, disposition:"Prescription Sent",
+    talkTimeSeconds:184, holdTimeSeconds:23, wrapUpTimeSeconds:78,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:true, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c030", timestamp:"2026-04-16T12:45:33",
+    ani:"+17865559900", dnis:"+18005550101",
+    agentId:"agent_5", agentName:"Ashley Brown",
+    campaignId:"camp_ib1", campaignName:"Patient Support", campaignType:"inbound",
+    duration:210, disposition:"Billing Inquiry",
+    talkTimeSeconds:135, holdTimeSeconds:21, wrapUpTimeSeconds:54,
+    queueWaitSeconds:38, answeredWithinThreshold:false,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:"+18005550101", contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c031", timestamp:"2026-04-16T15:00:00",
+    ani:"+18662141522", dnis:"+13055557766",
+    agentId:"agent_2", agentName:"Mike Chen",
+    campaignId:"camp_ob1", campaignName:"Weight Loss Outreach", campaignType:"outbound",
+    duration:330, disposition:"Appointment Scheduled",
+    talkTimeSeconds:214, holdTimeSeconds:28, wrapUpTimeSeconds:88,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:true, conversionFlag:true, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:1, abandoned:false,
+  },
 
-  // ── April 17 (Thursday) ─────────────────────────────────────────────────
-  { id:"c032", timestamp:"2026-04-17T09:15:00", ani:"+18662141523", dnis:"+13055558811", agentId:"agent_6", agentName:"James Martinez",  campaignId:"camp_ob4", campaignName:"New Patient Acquisition", duration:245, disposition:"Appointment Scheduled" },
-  { id:"c033", timestamp:"2026-04-17T10:30:45", ani:"+13055551144", dnis:"+18005550100", agentId:"agent_1", agentName:"Sarah Johnson",   campaignId:"camp_ib3", campaignName:"General Inquiry",         duration:170, disposition:"Callback Requested"     },
-  { id:"c034", timestamp:"2026-04-17T11:45:22", ani:"+18559871100", dnis:"+17865554455", agentId:"agent_4", agentName:"David Williams",  campaignId:"camp_ob2", campaignName:"Follow-Up Campaign",      duration:365, disposition:"Prescription Sent"      },
-  { id:"c035", timestamp:"2026-04-17T14:00:10", ani:"+17865557788", dnis:"+18005550102", agentId:"agent_5", agentName:"Ashley Brown",    campaignId:"camp_ib4", campaignName:"Insurance Verification",  duration:490, disposition:"Transferred to Nurse"   },
-  // Manual dial — classified outbound via campaign name (Rule 2)
-  { id:"c036", timestamp:"2026-04-17T15:30:00", ani:null,           dnis:"+13055553388", agentId:"agent_2", agentName:"Mike Chen",       campaignId:"camp_ob1", campaignName:"Weight Loss Outreach",    duration:135, disposition:"Voicemail Left"         },
+  // ── April 17 ─────────────────────────────────────────────────────────────
+  {
+    id:"c032", timestamp:"2026-04-17T09:15:00",
+    ani:"+18662141523", dnis:"+13055558811",
+    agentId:"agent_6", agentName:"James Martinez",
+    campaignId:"camp_ob4", campaignName:"New Patient Acquisition", campaignType:"outbound",
+    duration:245, disposition:"Appointment Scheduled",
+    talkTimeSeconds:159, holdTimeSeconds:20, wrapUpTimeSeconds:66,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:true, conversionFlag:true, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c033", timestamp:"2026-04-17T10:30:45",
+    ani:"+13055551144", dnis:"+18005550100",
+    agentId:"agent_1", agentName:"Sarah Johnson",
+    campaignId:"camp_ib3", campaignName:"General Inquiry", campaignType:"inbound",
+    duration:170, disposition:"Billing Inquiry",
+    talkTimeSeconds:110, holdTimeSeconds:17, wrapUpTimeSeconds:43,
+    queueWaitSeconds:25, answeredWithinThreshold:true,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:"+18005550100", contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c034", timestamp:"2026-04-17T11:45:22",
+    ani:"+18559871100", dnis:"+17865554455",
+    agentId:"agent_4", agentName:"David Williams",
+    campaignId:"camp_ob2", campaignName:"Follow-Up Campaign", campaignType:"outbound",
+    duration:365, disposition:"Prescription Sent",
+    talkTimeSeconds:236, holdTimeSeconds:30, wrapUpTimeSeconds:99,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:true, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c035", timestamp:"2026-04-17T14:00:10",
+    ani:"+17865557788", dnis:"+18005550102",
+    agentId:"agent_5", agentName:"Ashley Brown",
+    campaignId:"camp_ib4", campaignName:"Insurance Verification", campaignType:"inbound",
+    duration:490, disposition:"Transferred to Nurse",
+    talkTimeSeconds:317, holdTimeSeconds:49, wrapUpTimeSeconds:124,
+    queueWaitSeconds:50, answeredWithinThreshold:false,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:true, escalatedToClinical:true,
+    dialedMarketingNumber:"+18005550102", contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c036", timestamp:"2026-04-17T15:30:00",
+    ani:null, dnis:"+13055553388",
+    agentId:"agent_2", agentName:"Mike Chen",
+    campaignId:"camp_ob1", campaignName:"Weight Loss Outreach", campaignType:"outbound",
+    duration:135, disposition:"Voicemail Left",
+    talkTimeSeconds:60, holdTimeSeconds:0, wrapUpTimeSeconds:75,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:false, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:2, abandoned:false,
+  },
 
-  // ── April 18 (Friday) ───────────────────────────────────────────────────
-  { id:"c037", timestamp:"2026-04-18T09:45:00", ani:"+18662141522", dnis:"+13055559922", agentId:"agent_2", agentName:"Mike Chen",       campaignId:"camp_ob4", campaignName:"New Patient Acquisition", duration:280, disposition:"Appointment Scheduled" },
-  { id:"c038", timestamp:"2026-04-18T11:00:30", ani:"+13055556644", dnis:"+18005550100", agentId:"agent_3", agentName:"Emily Rodriguez", campaignId:"camp_ib2", campaignName:"Appointment Scheduling",  duration:355, disposition:"Appointment Scheduled" },
-  { id:"c039", timestamp:"2026-04-18T13:15:00", ani:"+18662141523", dnis:"+17865558844", agentId:"agent_6", agentName:"James Martinez",  campaignId:"camp_ob5", campaignName:"Re-engagement Campaign",  duration:195, disposition:"Not Interested"         },
-  { id:"c040", timestamp:"2026-04-18T15:30:22", ani:"+17865553322", dnis:"+18005550101", agentId:"agent_1", agentName:"Sarah Johnson",   campaignId:"camp_ib1", campaignName:"Patient Support",         duration:225, disposition:"Transferred to Nurse"   },
+  // ── April 18 ─────────────────────────────────────────────────────────────
+  {
+    id:"c037", timestamp:"2026-04-18T09:45:00",
+    ani:"+18662141522", dnis:"+13055559922",
+    agentId:"agent_2", agentName:"Mike Chen",
+    campaignId:"camp_ob4", campaignName:"New Patient Acquisition", campaignType:"outbound",
+    duration:280, disposition:"Appointment Scheduled",
+    talkTimeSeconds:181, holdTimeSeconds:23, wrapUpTimeSeconds:76,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:true, conversionFlag:true, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c038", timestamp:"2026-04-18T11:00:30",
+    ani:"+13055556644", dnis:"+18005550100",
+    agentId:"agent_3", agentName:"Emily Rodriguez",
+    campaignId:"camp_ib2", campaignName:"Appointment Scheduling", campaignType:"inbound",
+    duration:355, disposition:"Appointment Scheduled",
+    talkTimeSeconds:230, holdTimeSeconds:35, wrapUpTimeSeconds:90,
+    queueWaitSeconds:22, answeredWithinThreshold:true,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:"+18005550100", contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c039", timestamp:"2026-04-18T13:15:00",
+    ani:"+18662141523", dnis:"+17865558844",
+    agentId:"agent_6", agentName:"James Martinez",
+    campaignId:"camp_ob5", campaignName:"Re-engagement Campaign", campaignType:"outbound",
+    duration:195, disposition:"Not Interested",
+    talkTimeSeconds:126, holdTimeSeconds:0, wrapUpTimeSeconds:69,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:true, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:2, abandoned:false,
+  },
+  {
+    id:"c040", timestamp:"2026-04-18T15:30:22",
+    ani:"+17865553322", dnis:"+18005550101",
+    agentId:"agent_1", agentName:"Sarah Johnson",
+    campaignId:"camp_ib1", campaignName:"Patient Support", campaignType:"inbound",
+    duration:225, disposition:"Transferred to Nurse",
+    talkTimeSeconds:145, holdTimeSeconds:22, wrapUpTimeSeconds:58,
+    queueWaitSeconds:18, answeredWithinThreshold:true,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:true, escalatedToClinical:true,
+    dialedMarketingNumber:"+18005550101", contactAttemptNumber:1, abandoned:false,
+  },
 
-  // ── April 21 (Monday) ───────────────────────────────────────────────────
-  { id:"c041", timestamp:"2026-04-21T08:30:00", ani:"+18662141522", dnis:"+13055557711", agentId:"agent_2", agentName:"Mike Chen",       campaignId:"camp_ob1", campaignName:"Weight Loss Outreach",    duration:355, disposition:"Appointment Scheduled" },
-  { id:"c042", timestamp:"2026-04-21T09:15:44", ani:"+13055554422", dnis:"+18005550100", agentId:"agent_1", agentName:"Sarah Johnson",   campaignId:"camp_ib2", campaignName:"Appointment Scheduling",  duration:420, disposition:"Appointment Scheduled" },
-  { id:"c043", timestamp:"2026-04-21T10:00:00", ani:"+18559871100", dnis:"+13055556699", agentId:"agent_4", agentName:"David Williams",  campaignId:"camp_ob3", campaignName:"Prescription Renewal",    duration:305, disposition:"Prescription Sent"      },
-  { id:"c044", timestamp:"2026-04-21T11:30:15", ani:"+17865551133", dnis:"+18005550102", agentId:"agent_5", agentName:"Ashley Brown",    campaignId:"camp_ib4", campaignName:"Insurance Verification",  duration:615, disposition:"Transferred to Nurse"   },
-  { id:"c045", timestamp:"2026-04-21T13:00:00", ani:"+18662141523", dnis:"+13055553311", agentId:"agent_6", agentName:"James Martinez",  campaignId:"camp_ob4", campaignName:"New Patient Acquisition", duration:195, disposition:"Appointment Scheduled" },
-  { id:"c046", timestamp:"2026-04-21T14:15:30", ani:"+13055558866", dnis:"+18005550100", agentId:"agent_3", agentName:"Emily Rodriguez", campaignId:"camp_ib3", campaignName:"General Inquiry",         duration:145, disposition:"Wrong Number"           },
-  { id:"c047", timestamp:"2026-04-21T16:00:00", ani:"+18559871100", dnis:"+17865557711", agentId:"agent_4", agentName:"David Williams",  campaignId:"camp_ob2", campaignName:"Follow-Up Campaign",      duration:270, disposition:"Prescription Sent"      },
+  // ── April 21 ─────────────────────────────────────────────────────────────
+  {
+    id:"c041", timestamp:"2026-04-21T08:30:00",
+    ani:"+18662141522", dnis:"+13055557711",
+    agentId:"agent_2", agentName:"Mike Chen",
+    campaignId:"camp_ob1", campaignName:"Weight Loss Outreach", campaignType:"outbound",
+    duration:355, disposition:"Appointment Scheduled",
+    talkTimeSeconds:230, holdTimeSeconds:28, wrapUpTimeSeconds:97,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:true, conversionFlag:true, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c042", timestamp:"2026-04-21T09:15:44",
+    ani:"+13055554422", dnis:"+18005550100",
+    agentId:"agent_1", agentName:"Sarah Johnson",
+    campaignId:"camp_ib2", campaignName:"Appointment Scheduling", campaignType:"inbound",
+    duration:420, disposition:"Appointment Scheduled",
+    talkTimeSeconds:272, holdTimeSeconds:42, wrapUpTimeSeconds:106,
+    queueWaitSeconds:28, answeredWithinThreshold:true,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:"+18005550100", contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c043", timestamp:"2026-04-21T10:00:00",
+    ani:"+18559871100", dnis:"+13055556699",
+    agentId:"agent_4", agentName:"David Williams",
+    campaignId:"camp_ob3", campaignName:"Prescription Renewal", campaignType:"outbound",
+    duration:305, disposition:"Prescription Sent",
+    talkTimeSeconds:197, holdTimeSeconds:25, wrapUpTimeSeconds:83,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:true, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c044", timestamp:"2026-04-21T11:30:15",
+    ani:"+17865551133", dnis:"+18005550102",
+    agentId:"agent_5", agentName:"Ashley Brown",
+    campaignId:"camp_ib4", campaignName:"Insurance Verification", campaignType:"inbound",
+    duration:615, disposition:"Transferred to Nurse",
+    talkTimeSeconds:398, holdTimeSeconds:62, wrapUpTimeSeconds:155,
+    queueWaitSeconds:65, answeredWithinThreshold:false,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:true, escalatedToClinical:true,
+    dialedMarketingNumber:"+18005550102", contactAttemptNumber:2, abandoned:false,
+  },
+  {
+    id:"c045", timestamp:"2026-04-21T13:00:00",
+    ani:"+18662141523", dnis:"+13055553311",
+    agentId:"agent_6", agentName:"James Martinez",
+    campaignId:"camp_ob4", campaignName:"New Patient Acquisition", campaignType:"outbound",
+    duration:195, disposition:"Appointment Scheduled",
+    talkTimeSeconds:126, holdTimeSeconds:16, wrapUpTimeSeconds:53,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:true, conversionFlag:true, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c046", timestamp:"2026-04-21T14:15:30",
+    ani:"+13055558866", dnis:"+18005550100",
+    agentId:"agent_3", agentName:"Emily Rodriguez",
+    campaignId:"camp_ib3", campaignName:"General Inquiry", campaignType:"inbound",
+    duration:145, disposition:"Wrong Number",
+    talkTimeSeconds:45, holdTimeSeconds:0, wrapUpTimeSeconds:100,
+    queueWaitSeconds:8, answeredWithinThreshold:true,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:"+18005550100", contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c047", timestamp:"2026-04-21T16:00:00",
+    ani:"+18559871100", dnis:"+17865557711",
+    agentId:"agent_4", agentName:"David Williams",
+    campaignId:"camp_ob2", campaignName:"Follow-Up Campaign", campaignType:"outbound",
+    duration:270, disposition:"Prescription Sent",
+    talkTimeSeconds:175, holdTimeSeconds:22, wrapUpTimeSeconds:73,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:true, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:1, abandoned:false,
+  },
 
-  // ── April 22 (Tuesday — today) ──────────────────────────────────────────
-  { id:"c048", timestamp:"2026-04-22T08:15:00", ani:"+18662141522", dnis:"+13055552277", agentId:"agent_2", agentName:"Mike Chen",       campaignId:"camp_ob1", campaignName:"Weight Loss Outreach",    duration:315, disposition:"Appointment Scheduled" },
-  { id:"c049", timestamp:"2026-04-22T09:00:22", ani:"+13055559955", dnis:"+18005550100", agentId:"agent_1", agentName:"Sarah Johnson",   campaignId:"camp_ib2", campaignName:"Appointment Scheduling",  duration:260, disposition:"Appointment Scheduled" },
-  { id:"c050", timestamp:"2026-04-22T09:45:00", ani:"+18559871100", dnis:"+13055557733", agentId:"agent_4", agentName:"David Williams",  campaignId:"camp_ob3", campaignName:"Prescription Renewal",    duration:345, disposition:"Prescription Sent"      },
-  { id:"c051", timestamp:"2026-04-22T10:30:15", ani:"+17865556611", dnis:"+18005550101", agentId:"agent_5", agentName:"Ashley Brown",    campaignId:"camp_ib4", campaignName:"Insurance Verification",  duration:520, disposition:"Transferred to Nurse"   },
-  { id:"c052", timestamp:"2026-04-22T11:00:00", ani:"+18662141523", dnis:"+13055554477", agentId:"agent_6", agentName:"James Martinez",  campaignId:"camp_ob4", campaignName:"New Patient Acquisition", duration:185, disposition:"No Answer"              },
-  { id:"c053", timestamp:"2026-04-22T11:45:30", ani:"+13055551166", dnis:"+18005550100", agentId:"agent_3", agentName:"Emily Rodriguez", campaignId:"camp_ib1", campaignName:"Patient Support",         duration:200, disposition:"Callback Requested"     },
-  { id:"c054", timestamp:"2026-04-22T13:00:00", ani:"+18662141522", dnis:"+17865558833", agentId:"agent_2", agentName:"Mike Chen",       campaignId:"camp_ob5", campaignName:"Re-engagement Campaign",  duration:165, disposition:"Already a Patient"      },
-  { id:"c055", timestamp:"2026-04-22T13:30:00", ani:"+17865554422", dnis:"+18005550102", agentId:"agent_1", agentName:"Sarah Johnson",   campaignId:"camp_ib3", campaignName:"General Inquiry",         duration:140, disposition:"Disconnected"           },
+  // ── April 22 ─────────────────────────────────────────────────────────────
+  {
+    id:"c048", timestamp:"2026-04-22T08:15:00",
+    ani:"+18662141522", dnis:"+13055552277",
+    agentId:"agent_2", agentName:"Mike Chen",
+    campaignId:"camp_ob1", campaignName:"Weight Loss Outreach", campaignType:"outbound",
+    duration:315, disposition:"Appointment Scheduled",
+    talkTimeSeconds:204, holdTimeSeconds:26, wrapUpTimeSeconds:85,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:true, conversionFlag:true, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c049", timestamp:"2026-04-22T09:00:22",
+    ani:"+13055559955", dnis:"+18005550100",
+    agentId:"agent_1", agentName:"Sarah Johnson",
+    campaignId:"camp_ib2", campaignName:"Appointment Scheduling", campaignType:"inbound",
+    duration:260, disposition:"Appointment Scheduled",
+    talkTimeSeconds:168, holdTimeSeconds:26, wrapUpTimeSeconds:66,
+    queueWaitSeconds:20, answeredWithinThreshold:true,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:"+18005550100", contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c050", timestamp:"2026-04-22T09:45:00",
+    ani:"+18559871100", dnis:"+13055557733",
+    agentId:"agent_4", agentName:"David Williams",
+    campaignId:"camp_ob3", campaignName:"Prescription Renewal", campaignType:"outbound",
+    duration:345, disposition:"Prescription Sent",
+    talkTimeSeconds:223, holdTimeSeconds:28, wrapUpTimeSeconds:94,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:true, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c051", timestamp:"2026-04-22T10:30:15",
+    ani:"+17865556611", dnis:"+18005550102",
+    agentId:"agent_5", agentName:"Ashley Brown",
+    campaignId:"camp_ib4", campaignName:"Insurance Verification", campaignType:"inbound",
+    duration:520, disposition:"Transferred to Nurse",
+    talkTimeSeconds:337, holdTimeSeconds:52, wrapUpTimeSeconds:131,
+    queueWaitSeconds:42, answeredWithinThreshold:false,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:true, escalatedToClinical:true,
+    dialedMarketingNumber:"+18005550102", contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c052", timestamp:"2026-04-22T11:00:00",
+    ani:"+18662141523", dnis:"+13055554477",
+    agentId:"agent_6", agentName:"James Martinez",
+    campaignId:"camp_ob4", campaignName:"New Patient Acquisition", campaignType:"outbound",
+    duration:185, disposition:"No Answer",
+    talkTimeSeconds:0, holdTimeSeconds:0, wrapUpTimeSeconds:185,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:false, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:2, abandoned:false,
+  },
+  {
+    id:"c053", timestamp:"2026-04-22T11:45:30",
+    ani:"+13055551166", dnis:"+18005550100",
+    agentId:"agent_3", agentName:"Emily Rodriguez",
+    campaignId:"camp_ib1", campaignName:"Patient Support", campaignType:"inbound",
+    duration:200, disposition:"Medical Question",
+    talkTimeSeconds:129, holdTimeSeconds:20, wrapUpTimeSeconds:51,
+    queueWaitSeconds:30, answeredWithinThreshold:true,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:"+18005550100", contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c054", timestamp:"2026-04-22T13:00:00",
+    ani:"+18662141522", dnis:"+17865558833",
+    agentId:"agent_2", agentName:"Mike Chen",
+    campaignId:"camp_ob5", campaignName:"Re-engagement Campaign", campaignType:"outbound",
+    duration:165, disposition:"Already a Patient",
+    talkTimeSeconds:107, holdTimeSeconds:0, wrapUpTimeSeconds:58,
+    queueWaitSeconds:0, answeredWithinThreshold:null,
+    pickupFlag:true, conversionFlag:false, saveFlag:true,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:null, contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c055", timestamp:"2026-04-22T13:30:00",
+    ani:"+17865554422", dnis:"+18005550102",
+    agentId:"agent_1", agentName:"Sarah Johnson",
+    campaignId:"camp_ib3", campaignName:"General Inquiry", campaignType:"inbound",
+    duration:140, disposition:"Billing Inquiry",
+    talkTimeSeconds:85, holdTimeSeconds:0, wrapUpTimeSeconds:55,
+    queueWaitSeconds:15, answeredWithinThreshold:true,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:"+18005550102", contactAttemptNumber:1, abandoned:false,
+  },
+
+  // ── Abandoned inbound calls (c056–c063) ───────────────────────────────────
+  // Customer hung up before an agent answered.
+  {
+    id:"c056", timestamp:"2026-04-09T13:00:00",
+    ani:"+13055550001", dnis:"+18005550101",
+    agentId:null, agentName:null,
+    campaignId:"camp_ib2", campaignName:"Appointment Scheduling", campaignType:"inbound",
+    duration:0, disposition:"Abandoned",
+    talkTimeSeconds:0, holdTimeSeconds:0, wrapUpTimeSeconds:0,
+    queueWaitSeconds:65, answeredWithinThreshold:false,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:"+18005550101", contactAttemptNumber:1, abandoned:true,
+  },
+  {
+    id:"c057", timestamp:"2026-04-10T10:00:00",
+    ani:"+13055550002", dnis:"+18005550100",
+    agentId:null, agentName:null,
+    campaignId:"camp_ib1", campaignName:"Patient Support", campaignType:"inbound",
+    duration:0, disposition:"Abandoned",
+    talkTimeSeconds:0, holdTimeSeconds:0, wrapUpTimeSeconds:0,
+    queueWaitSeconds:88, answeredWithinThreshold:false,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:"+18005550100", contactAttemptNumber:1, abandoned:true,
+  },
+  {
+    id:"c058", timestamp:"2026-04-14T12:00:00",
+    ani:"+13055550003", dnis:"+18005550100",
+    agentId:null, agentName:null,
+    campaignId:"camp_ib3", campaignName:"General Inquiry", campaignType:"inbound",
+    duration:0, disposition:"Abandoned",
+    talkTimeSeconds:0, holdTimeSeconds:0, wrapUpTimeSeconds:0,
+    queueWaitSeconds:120, answeredWithinThreshold:false,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:"+18005550100", contactAttemptNumber:1, abandoned:true,
+  },
+  {
+    id:"c059", timestamp:"2026-04-15T09:30:00",
+    ani:"+13055550004", dnis:"+18005550101",
+    agentId:null, agentName:null,
+    campaignId:"camp_ib2", campaignName:"Appointment Scheduling", campaignType:"inbound",
+    duration:0, disposition:"Abandoned",
+    talkTimeSeconds:0, holdTimeSeconds:0, wrapUpTimeSeconds:0,
+    queueWaitSeconds:52, answeredWithinThreshold:false,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:"+18005550101", contactAttemptNumber:1, abandoned:true,
+  },
+  {
+    id:"c060", timestamp:"2026-04-16T14:00:00",
+    ani:"+13055550005", dnis:"+18005550102",
+    agentId:null, agentName:null,
+    campaignId:"camp_ib4", campaignName:"Insurance Verification", campaignType:"inbound",
+    duration:0, disposition:"Abandoned",
+    talkTimeSeconds:0, holdTimeSeconds:0, wrapUpTimeSeconds:0,
+    queueWaitSeconds:95, answeredWithinThreshold:false,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:"+18005550102", contactAttemptNumber:1, abandoned:true,
+  },
+  {
+    id:"c061", timestamp:"2026-04-17T11:00:00",
+    ani:"+13055550006", dnis:"+18005550100",
+    agentId:null, agentName:null,
+    campaignId:"camp_ib1", campaignName:"Patient Support", campaignType:"inbound",
+    duration:0, disposition:"Abandoned",
+    talkTimeSeconds:0, holdTimeSeconds:0, wrapUpTimeSeconds:0,
+    queueWaitSeconds:45, answeredWithinThreshold:false,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:"+18005550100", contactAttemptNumber:1, abandoned:true,
+  },
+  {
+    id:"c062", timestamp:"2026-04-21T10:30:00",
+    ani:"+13055550007", dnis:"+18005550101",
+    agentId:null, agentName:null,
+    campaignId:"camp_ib2", campaignName:"Appointment Scheduling", campaignType:"inbound",
+    duration:0, disposition:"Abandoned",
+    talkTimeSeconds:0, holdTimeSeconds:0, wrapUpTimeSeconds:0,
+    queueWaitSeconds:78, answeredWithinThreshold:false,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:"+18005550101", contactAttemptNumber:1, abandoned:true,
+  },
+  {
+    id:"c063", timestamp:"2026-04-22T10:15:00",
+    ani:"+13055550008", dnis:"+18005550100",
+    agentId:null, agentName:null,
+    campaignId:"camp_ib3", campaignName:"General Inquiry", campaignType:"inbound",
+    duration:0, disposition:"Abandoned",
+    talkTimeSeconds:0, holdTimeSeconds:0, wrapUpTimeSeconds:0,
+    queueWaitSeconds:110, answeredWithinThreshold:false,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:"+18005550100", contactAttemptNumber:1, abandoned:true,
+  },
+
+  // ── Additional inbound calls with explicit support dispositions (c064–c068) ─
+  {
+    id:"c064", timestamp:"2026-04-15T14:00:00",
+    ani:"+13055551500", dnis:"+18005550100",
+    agentId:"agent_3", agentName:"Emily Rodriguez",
+    campaignId:"camp_ib3", campaignName:"General Inquiry", campaignType:"inbound",
+    duration:180, disposition:"Billing Inquiry",
+    talkTimeSeconds:115, holdTimeSeconds:18, wrapUpTimeSeconds:47,
+    queueWaitSeconds:22, answeredWithinThreshold:true,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:"+18005550100", contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c065", timestamp:"2026-04-16T11:00:00",
+    ani:"+13055551501", dnis:"+18005550100",
+    agentId:"agent_1", agentName:"Sarah Johnson",
+    campaignId:"camp_ib1", campaignName:"Patient Support", campaignType:"inbound",
+    duration:240, disposition:"Medical Question",
+    talkTimeSeconds:155, holdTimeSeconds:24, wrapUpTimeSeconds:61,
+    queueWaitSeconds:18, answeredWithinThreshold:true,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:"+18005550100", contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c066", timestamp:"2026-04-17T13:30:00",
+    ani:"+13055551502", dnis:"+18005550101",
+    agentId:"agent_5", agentName:"Ashley Brown",
+    campaignId:"camp_ib3", campaignName:"General Inquiry", campaignType:"inbound",
+    duration:165, disposition:"Billing Inquiry",
+    talkTimeSeconds:106, holdTimeSeconds:16, wrapUpTimeSeconds:43,
+    queueWaitSeconds:32, answeredWithinThreshold:false,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:"+18005550101", contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c067", timestamp:"2026-04-21T15:00:00",
+    ani:"+13055551503", dnis:"+18005550100",
+    agentId:"agent_3", agentName:"Emily Rodriguez",
+    campaignId:"camp_ib1", campaignName:"Patient Support", campaignType:"inbound",
+    duration:290, disposition:"Medical Question",
+    talkTimeSeconds:188, holdTimeSeconds:29, wrapUpTimeSeconds:73,
+    queueWaitSeconds:26, answeredWithinThreshold:true,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:"+18005550100", contactAttemptNumber:1, abandoned:false,
+  },
+  {
+    id:"c068", timestamp:"2026-04-22T12:00:00",
+    ani:"+13055551504", dnis:"+18005550101",
+    agentId:"agent_1", agentName:"Sarah Johnson",
+    campaignId:"camp_ib3", campaignName:"General Inquiry", campaignType:"inbound",
+    duration:155, disposition:"Billing Inquiry",
+    talkTimeSeconds:100, holdTimeSeconds:15, wrapUpTimeSeconds:40,
+    queueWaitSeconds:28, answeredWithinThreshold:true,
+    pickupFlag:null, conversionFlag:false, saveFlag:false,
+    transferred:false, escalatedToClinical:false,
+    dialedMarketingNumber:"+18005550101", contactAttemptNumber:1, abandoned:false,
+  },
 ];
 
-module.exports = { agents, outboundANIs, campaigns, calls };
+// ── Agent Sessions ─────────────────────────────────────────────────────────
+// One session per agent per working day in the data range.
+// stateSeconds keys: available, on_call, on_hold, wrap_up, not_ready, on_break
+// Sum of all stateSeconds === loggedInSeconds (enforced at generation time).
+//
+// Replace with SELECT * FROM agent_sessions WHERE … when moving to PostgreSQL.
+
+const SESSION_DAYS = [
+  "2026-04-08","2026-04-09","2026-04-10","2026-04-11",
+  "2026-04-14","2026-04-15","2026-04-16","2026-04-17",
+  "2026-04-18","2026-04-21","2026-04-22",
+];
+
+// Baseline daily seconds per state per agent (sum = 34200 = 9.5-hour shift)
+const STATE_BASELINES = {
+  agent_1: { on_call:14000, on_hold:2200, wrap_up:4800, available:8800, not_ready:1000, on_break:3400 },
+  agent_2: { on_call:15500, on_hold:2600, wrap_up:5500, available:7400, not_ready: 600, on_break:2600 },
+  agent_3: { on_call:14500, on_hold:2000, wrap_up:5000, available:7700, not_ready:1300, on_break:3700 },
+  agent_4: { on_call:15000, on_hold:2400, wrap_up:5200, available:7500, not_ready: 900, on_break:3200 },
+  agent_5: { on_call:13500, on_hold:1800, wrap_up:4500, available:9000, not_ready:1800, on_break:3600 },
+  agent_6: { on_call:16000, on_hold:2800, wrap_up:5800, available:7300, not_ready: 500, on_break:1800 },
+};
+
+const LOGGED_IN_SECONDS = 34200;
+const STATE_KEYS = ["on_call","on_hold","wrap_up","not_ready","on_break"];
+
+const agentSessions = [];
+for (const date of SESSION_DAYS) {
+  for (const agent of agents) {
+    const base = STATE_BASELINES[agent.id];
+
+    // Vary each state deterministically ±15%
+    const raw = {};
+    for (const k of STATE_KEYS) raw[k] = vary(base[k], 0.85, 1.15);
+
+    // Force "available" to be whatever is left so the sum is always exact
+    const usedSeconds = STATE_KEYS.reduce((s, k) => s + raw[k], 0);
+    raw.available = Math.max(0, LOGGED_IN_SECONDS - usedSeconds);
+
+    agentSessions.push({
+      agentId:         agent.id,
+      agentName:       agent.name,
+      date,
+      loggedInSeconds: LOGGED_IN_SECONDS,
+      stateSeconds:    { ...raw },
+    });
+  }
+}
+
+// ── Exports ────────────────────────────────────────────────────────────────
+module.exports = { agents, outboundANIs, campaigns, calls, agentSessions };
