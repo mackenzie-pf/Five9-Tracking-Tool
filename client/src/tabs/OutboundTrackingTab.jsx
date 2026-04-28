@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo } from "react";
 import {
   ResponsiveContainer, LineChart, Line, BarChart, Bar, XAxis, YAxis,
-  CartesianGrid, Tooltip, Legend, Cell,
+  CartesianGrid, Tooltip, Legend, Cell, ReferenceLine,
 } from "recharts";
 import {
   fetchTimeline,
@@ -314,16 +314,18 @@ export default function OutboundTrackingTab({ filters }) {
         <Card title="Outbound by Dialer Type" subtitle="Predictive · Preview · Progressive" loading={loading}>
           {byCampType.length > 0 ? (
             <ResponsiveContainer width="100%" height={200}>
-              <BarChart data={byCampType} margin={{ top: 4, right: 8, left: -16, bottom: 4 }}>
+              <BarChart data={byCampType} margin={{ top: 4, right: 48, left: -16, bottom: 4 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#334155" vertical={false} />
                 <XAxis dataKey="dialerType" tick={{ fill: "#94A3B8", fontSize: 11 }} axisLine={false} tickLine={false} />
-                <YAxis tick={{ fill: "#94A3B8", fontSize: 10 }} axisLine={false} tickLine={false} />
+                <YAxis yAxisId="left" tick={{ fill: "#94A3B8", fontSize: 10 }} axisLine={false} tickLine={false} />
+                <YAxis yAxisId="right" orientation="right" domain={[0, 100]}
+                  tick={{ fill: "#94A3B8", fontSize: 10 }} axisLine={false} tickLine={false}
+                  tickFormatter={v => `${v}%`} />
                 <Tooltip content={<DarkTooltip />} />
-                <Bar dataKey="count" name="Calls" radius={[4,4,0,0]} maxBarSize={48}>
+                <Bar yAxisId="left"  dataKey="count"      name="Calls"     radius={[4,4,0,0]} maxBarSize={48}>
                   {byCampType.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
                 </Bar>
-                <Bar dataKey="pickupRate" name="Pickup %" fill="#22C55E" radius={[4,4,0,0]} maxBarSize={28} yAxisId="r">
-                </Bar>
+                <Bar yAxisId="right" dataKey="pickupRate" name="Pickup %" fill="#22C55E80" radius={[4,4,0,0]} maxBarSize={28} />
               </BarChart>
             </ResponsiveContainer>
           ) : <Empty loading={loading} />}

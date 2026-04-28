@@ -46,7 +46,8 @@ export const fetchLiveVsNoAnswerByANI   = (f) => get(`${BASE}/api/metrics/outbou
 export const fetchOutboundAbandonRate   = (f) => get(`${BASE}/api/metrics/outbound/abandon-rate${qs(f)}`);
 export const fetchOutboundByCampaign    = (f) => get(`${BASE}/api/metrics/outbound/by-campaign${qs(f)}`);
 export const fetchOutboundByCampaignType= (f) => get(`${BASE}/api/metrics/outbound/by-campaign-type${qs(f)}`);
-export const fetchOutboundByANIAndCamp  = (f) => get(`${BASE}/api/metrics/outbound/by-ani-and-campaign${qs(f)}`);
+export const fetchOutboundByANIAndCamp     = (f) => get(`${BASE}/api/metrics/outbound/by-ani-and-campaign${qs(f)}`);
+export const fetchOutboundByANIAndCampaign = fetchOutboundByANIAndCamp; // alias used by OutboundTrackingTab
 
 // ── Group 3: Inbound Queue ─────────────────────────────────────────────────
 export const fetchMedianResponseTime    = (f) => get(`${BASE}/api/metrics/inbound/median-response-time${qs(f)}`);
